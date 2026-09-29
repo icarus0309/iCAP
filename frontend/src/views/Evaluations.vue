@@ -1,0 +1,24 @@
+<script setup>
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { api, readSSE } from '../api'
+const rows = ref([]), models = ref([]), datasets = ref([]), dialog = ref(false), active = ref(null)
+const form = reactive({ model_ids: [], dataset_id: '', benchmark: 'Ruler1' })
+let controller
+let timer
+const names = { queued: '排队中', running: '运行中', paused: '已暂停', completed: '已完成', cancelled: '已取消', failed: '失败' }
+async function load() { [rows.value, models.value, datasets.value] = await Promise.all([api.get('/evaluations'), api.get('/models'), api.get('/datasets')]); if (active.value) active.value = rows.value.find(x => x.id === active.value.id) || null }
+onMounted(() => { load(); timer = setInterval(load, 4500) })
+onUnmounted(() => { clearInterval(timer); controller?.abort() })
+async function create() { if (!form.model_ids.length || !form.dataset_id) return ElMessage.warning('请选择模型和数据集'); const tasks = await api.post('/evaluations/batch', form); dialog.value = false; await load(); show(tasks[0]); ElMessage.success(`已提交 ${tasks.length} 个评测任务`) }
+async function action(row, command) { await api.patch(`/evaluations/${row.id}`, { action: command }); await load() }
+function show(row) { controller?.abort(); active.value = row; controller = new AbortController(); readSSE(`/evaluations/${row.id}/events`, null, (event, data) => { if (event === 'state') { active.value = data; rows.value = rows.value.map(x => x.id === data.id ? data : x) } }, controller.signal).catch(error => { if (error.name !== 'AbortError') ElMessage.error(error.message) }) }
+function close() { controller?.abort(); active.value = null }
+</script>
+<template>
+  <div class="page-heading"><div><div class="eyebrow">DATA / EVALUATION</div><h1>评测任务</h1><p class="subtitle">创建任务，流式查看执行日志，控制评测生命周期。</p></div><el-button type="primary" @click="dialog=true">+ 发起评测</el-button></div>
+  <div class="notice">任务调度、进度和报告生成可完整体验；评分由模拟执行器计算，未调用真实测试用例。</div>
+  <section class="card card-pad"><div class="card-header"><h2>任务列表</h2><span class="muted small">{{ rows.length }} 个任务</span></div><el-table :data="rows" empty-text="暂无任务，点击右上角发起评测"><el-table-column prop="model_name" label="模型" min-width="150" /><el-table-column prop="dataset_name" label="数据集" min-width="170" /><el-table-column prop="benchmark" label="测评尺子" width="100" /><el-table-column label="进度" min-width="150"><template #default="{row}"><el-progress :percentage="row.progress" :stroke-width="6" /></template></el-table-column><el-table-column label="状态" width="100"><template #default="{row}"><el-tag size="small" :type="row.status === 'completed' ? 'success' : row.status === 'cancelled' ? 'info' : 'warning'">{{ names[row.status] }}</el-tag></template></el-table-column><el-table-column prop="created_at" label="创建时间" min-width="175" /><el-table-column label="操作" width="180"><template #default="{row}"><el-button text type="primary" size="small" @click="show(row)">详情</el-button><el-button v-if="['queued','running'].includes(row.status)" text size="small" @click="action(row,'pause')">暂停</el-button><el-button v-if="row.status === 'paused'" text size="small" @click="action(row,'resume')">恢复</el-button><el-button v-if="['queued','running','paused'].includes(row.status)" text type="danger" size="small" @click="action(row,'cancel')">取消</el-button></template></el-table-column></el-table></section>
+  <el-dialog v-model="dialog" title="发起评测任务" width="min(500px,95vw)"><el-form label-position="top"><el-form-item label="模型（最多 4 个，并行比较）"><el-select v-model="form.model_ids" multiple :multiple-limit="4" placeholder="选择模型" style="width:100%"><el-option v-for="m in models" :key="m.id" :label="m.name" :value="m.id" /></el-select></el-form-item><el-form-item label="数据集"><el-select v-model="form.dataset_id" placeholder="选择数据集" style="width:100%"><el-option v-for="d in datasets" :key="d.id" :label="d.name" :value="d.id" /></el-select></el-form-item><el-form-item label="测评类型"><el-select v-model="form.benchmark" style="width:100%"><el-option v-for="x in ['Ruler1','Ruler2','VLM','AISF','Dev','ASR','MT','TTS']" :key="x" :label="x" :value="x" /></el-select></el-form-item></el-form><template #footer><el-button @click="dialog=false">取消</el-button><el-button type="primary" @click="create">提交任务</el-button></template></el-dialog>
+  <el-drawer :model-value="!!active" :title="active ? `评测详情 · ${active.model_name}` : ''" size="min(540px,100vw)" @close="close"><template v-if="active"><div class="flex-between"><span class="chip">{{ active.benchmark }}</span><span class="muted small">{{ names[active.status] }}</span></div><el-progress :percentage="active.progress" style="margin:25px 0" /><div class="card-header"><h2>执行日志</h2><span class="muted small">SSE 实时更新</span></div><div class="log-box">{{ active.logs.join('\n') }}</div><div v-if="active.report_id" class="notice section-gap">报告已生成，可在“评测报告”页面查看和发布。</div></template></el-drawer>
+</template>

@@ -1,0 +1,35 @@
+<script setup>
+import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { api } from '../api'
+import EChart from '../components/EChart.vue'
+
+const models = ref([])
+const keyword = ref('')
+const selected = ref([])
+const scenario = ref('language')
+const recommendations = ref([])
+const dialog = ref(false)
+const editing = ref(null)
+const form = reactive({ name: '', provider: '', modality: '文本', architecture: 'Dense', context_length: 32768, description: '', scores: [70, 70, 70, 70, 70] })
+const axes = ['语言', '推理', '代码', '多模态', '领域']
+const scenarios = [{ label: '语言问答', value: 'language' }, { label: '代码开发', value: 'code' }, { label: '复杂推理', value: 'reasoning' }, { label: '视觉理解', value: 'vision' }, { label: '通信领域', value: 'telecom' }]
+const filtered = computed(() => models.value.filter(m => (m.name + m.provider).toLowerCase().includes(keyword.value.toLowerCase())))
+const compare = computed(() => models.value.filter(m => selected.value.includes(m.id)))
+const radar = computed(() => ({ tooltip: {}, legend: { bottom: 0, textStyle: { color: '#717c90' } }, radar: { indicator: axes.map(name => ({ name, max: 100 })), splitLine: { lineStyle: { color: '#e8ebf0' } }, axisLine: { lineStyle: { color: '#e8ebf0' } } }, series: [{ type: 'radar', data: compare.value.map((m, i) => ({ name: m.name, value: m.scores, itemStyle: { color: ['#c91e32', '#426fbc', '#33a778'][i] }, areaStyle: { opacity: .08 } })) }] }))
+async function load() { models.value = await api.get('/models') }
+async function recommend() { recommendations.value = (await api.get('/recommendations', { params: { scenario: scenario.value } })).rows }
+onMounted(async () => { await load(); await recommend() })
+function edit(model) { editing.value = model?.id || null; Object.assign(form, model ? { ...model, scores: [...model.scores] } : { name: '', provider: '', modality: '文本', architecture: 'Dense', context_length: 32768, description: '', scores: [70, 70, 70, 70, 70] }); dialog.value = true }
+async function save() { if (!form.name.trim() || !form.provider.trim()) return ElMessage.warning('请输入模型名称和机构'); const body = { name: form.name, provider: form.provider, modality: form.modality, architecture: form.architecture, context_length: Number(form.context_length), description: form.description, scores: form.scores.map(Number) }; if (editing.value) await api.put(`/models/${editing.value}`, body); else await api.post('/models', body); dialog.value = false; ElMessage.success('模型已保存'); await load(); await recommend() }
+async function remove(model) { await ElMessageBox.confirm(`删除 ${model.name}？`, '确认操作', { type: 'warning' }); await api.delete(`/models/${model.id}`); selected.value = selected.value.filter(id => id !== model.id); await load() }
+function toggle(id) { selected.value = selected.value.includes(id) ? selected.value.filter(x => x !== id) : [...selected.value.slice(-2), id] }
+</script>
+<template>
+  <div class="page-heading"><div><div class="eyebrow">MAAS / MODEL HUB</div><h1>模型广场与选型</h1><p class="subtitle">登记模型、并列比较五维能力，并按业务场景推荐候选。</p></div><el-button type="primary" @click="edit(null)">+ 注册模型</el-button></div>
+  <div class="toolbar"><el-input v-model="keyword" clearable placeholder="搜索模型名称或机构" /><span class="muted small">共 {{ filtered.length }} 个模型 · 选择最多 3 个进行对比</span></div>
+  <div class="grid three"><div v-for="model in filtered" :key="model.id" class="card model-card"><div class="model-top"><span class="model-icon">◇</span><div style="flex:1"><div class="model-name">{{ model.name }}</div><div class="model-provider">{{ model.provider }} · {{ model.architecture }}</div></div><el-dropdown trigger="click"><span style="cursor:pointer;color:#8993a3">•••</span><template #dropdown><el-dropdown-menu><el-dropdown-item @click="edit(model)">编辑</el-dropdown-item><el-dropdown-item @click="remove(model)">删除</el-dropdown-item></el-dropdown-menu></template></el-dropdown></div><div class="model-meta"><span class="chip">{{ model.modality }}</span><el-tag size="small" type="info">{{ (model.context_length / 1024).toFixed(0) }}K 上下文</el-tag></div><div class="model-score"><span>五维示例均分</span><strong>{{ (model.scores.reduce((a,b) => a+b, 0)/5).toFixed(1) }}</strong></div><el-divider style="margin: 14px 0" /><div class="flex-between"><span class="muted small">{{ model.description || '暂无说明' }}</span><el-button size="small" :type="selected.includes(model.id) ? 'primary' : 'default'" @click="toggle(model.id)">{{ selected.includes(model.id) ? '已选择' : '加入对比' }}</el-button></div></div></div>
+  <div class="grid two section-gap"><section class="card card-pad"><div class="card-header"><h2>能力雷达对比</h2><span class="muted small">{{ compare.length }} / 3 个模型</span></div><EChart v-if="compare.length" :option="radar" height="310px" /><div v-else class="empty">点击上方“加入对比”查看五维雷达图</div></section><section class="card card-pad"><div class="card-header"><h2>场景推荐</h2><el-select v-model="scenario" style="width:145px" @change="recommend"><el-option v-for="item in scenarios" :key="item.value" :label="item.label" :value="item.value" /></el-select></div><div class="notice">基于示例能力分排序，用于演示选型交互。</div><ul class="flow-list"><li v-for="(model, index) in recommendations" :key="model.id"><span class="flow-index">{{ index + 1 }}</span><span style="flex:1">{{ model.name }} <span class="muted small">/ {{ model.provider }}</span></span><strong>{{ model.scores[['language','reasoning','code','vision','telecom'].indexOf(scenario)] }}</strong></li></ul></section></div>
+  <el-dialog v-model="dialog" :title="editing ? '编辑模型' : '注册模型'" width="min(580px, 95vw)"><el-form label-position="top"><div class="grid two"><el-form-item label="模型名称"><el-input v-model="form.name" /></el-form-item><el-form-item label="发布机构"><el-input v-model="form.provider" /></el-form-item><el-form-item label="模态"><el-select v-model="form.modality"><el-option label="文本" value="文本" /><el-option label="多模态" value="多模态" /></el-select></el-form-item><el-form-item label="架构"><el-select v-model="form.architecture"><el-option label="Dense" value="Dense" /><el-option label="MoE" value="MoE" /></el-select></el-form-item></div><el-form-item label="上下文长度 (tokens)"><el-input-number v-model="form.context_length" :min="1" :max="2000000" style="width:100%" /></el-form-item><el-form-item label="说明"><el-input v-model="form.description" type="textarea" /></el-form-item><div class="small muted" style="margin-bottom:9px">五维能力分（0–100）</div><div class="score-fields"><label v-for="(axis, i) in axes" :key="axis">{{ axis }}<el-input-number v-model="form.scores[i]" :min="0" :max="100" controls-position="right" /></label></div></el-form><template #footer><el-button @click="dialog=false">取消</el-button><el-button type="primary" @click="save">保存模型</el-button></template></el-dialog>
+</template>
+<style scoped>.score-fields { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }.score-fields label { font-size: 12px; color: #778297; }.score-fields .el-input-number { width: 100%; margin-top: 7px; } @media(max-width:760px) { .score-fields { grid-template-columns: repeat(2,1fr); } }</style>
