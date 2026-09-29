@@ -12,19 +12,8 @@ T = TypeVar("T")
 
 
 def seed() -> dict:
-    models = [
-        ("Qwen3-32B", "Qwen", "文本", "Dense", [88, 84, 90, 79, 75], "ready"),
-        ("DeepSeek-R1", "DeepSeek", "文本", "MoE", [94, 91, 88, 86, 80], "ready"),
-        ("GLM-4.5", "Zhipu", "文本", "MoE", [87, 86, 82, 84, 78], "ready"),
-        ("Qwen3-VL-8B", "Qwen", "多模态", "Dense", [78, 75, 83, 94, 70], "ready"),
-        ("Gemma-3-27B", "Google", "多模态", "Dense", [84, 80, 77, 87, 72], "ready"),
-    ]
     return {
-        "models": [dict(id=f"model-{i}", name=n, provider=p, modality=mod,
-                        architecture=arch, scores=s, status=status,
-                        context_length=131072 if i != 4 else 32768,
-                        description="演示模型：能力分为示例数据")
-                   for i, (n, p, mod, arch, s, status) in enumerate(models, 1)],
+        "models": [],
         "datasets": [
             dict(id="ds-1", name="通用能力样例集", category="通用", version="v1.0", size=240,
                  description="MMLU、数学与代码题目示例", files=[]),
@@ -62,6 +51,13 @@ class Store:
                 if key not in existing:
                     existing[key] = [] if isinstance(value, list) else value
                     missing = True
+            old_samples = {f"model-{i}" for i in range(1, 6)}
+            kept_models = [m for m in existing.get("models", [])
+                           if not (m.get("id") in old_samples and
+                                   m.get("description") == "演示模型：能力分为示例数据")]
+            if len(kept_models) != len(existing.get("models", [])):
+                existing["models"] = kept_models
+                missing = True
             if missing:
                 self._save(existing)
 
