@@ -1,0 +1,2 @@
+# iCAP
+InnovationCore AI Platform
