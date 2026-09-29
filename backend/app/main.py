@@ -18,13 +18,17 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .model_registry import ModelInput, ModelRegistry
 from .store import Store
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 def now() -> str:
@@ -45,16 +49,6 @@ def find(items: list[dict], identifier: str) -> dict:
 class Login(BaseModel):
     username: str
     password: str
-
-
-class ModelInput(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    provider: str = Field(min_length=1, max_length=60)
-    modality: str = "文本"
-    architecture: str = "Dense"
-    context_length: int = Field(default=32768, gt=0, le=2000000)
-    description: str = Field(default="", max_length=500)
-    scores: list[float] = Field(default_factory=lambda: [0] * 5, min_length=5, max_length=5)
 
 
 class DatasetInput(BaseModel):
@@ -109,9 +103,13 @@ class InferenceInput(BaseModel):
 
 
 class ChatInput(BaseModel):
-    model_id: str | None = None
+    model_id: str
     message: str = Field(min_length=1, max_length=8000)
     history: list[dict[str, str]] = Field(default_factory=list, max_length=20)
+    thinking: bool = False
+    top_k: int | None = Field(default=None, ge=0, le=1000)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    temperature: float | None = Field(default=None, ge=0, le=2)
 
 
 class ToolInput(BaseModel):
@@ -138,7 +136,8 @@ async def advance_jobs(store: Store, stop: asyncio.Event) -> None:
                         task["logs"].append(f"{now()} 模拟任务完成")
                         if group == "evaluations":
                             model = next((m for m in data["models"] if m["id"] == task["model_id"]), None)
-                            score = round(sum(model["scores"]) / 5, 1) if model else 0
+                            scores = model.get("scores", []) if model else []
+                            score = round(sum(scores) / len(scores), 1) if scores else 0
                             report = dict(id=uid("report"), evaluation_id=task["id"], title=f"{task['benchmark']} · {task['model_name']}",
                                           score=score, created_at=now(), published=False, simulated=True,
                                           summary=f"演示评测报告：{task['model_name']} 在 {task['dataset_name']} 上得到示例分数 {score}。"
@@ -161,6 +160,7 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
         raise RuntimeError("生产模式必须设置管理员账号、密码和至少 32 字符的签名密钥")
     base = Path(data_dir or os.getenv("INNOVATION_DATA_DIR", Path(__file__).resolve().parents[1] / "data"))
     store = Store(base)
+    registry = ModelRegistry(store)
     stop = asyncio.Event()
 
     @asynccontextmanager
@@ -215,32 +215,30 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
     @app.get("/api/dashboard", dependencies=[Depends(authorized)])
     def dashboard():
         data = store.snapshot()
-        return {"counts": {k: len(data[k]) for k in ("models", "datasets", "evaluations", "reports", "deployments", "school_jobs")},
+        counts = {k: len(data[k]) for k in ("models", "datasets", "evaluations", "reports", "deployments", "school_jobs")}
+        try:
+            counts["models"] = len(registry.list_models())
+        except HTTPException:
+            pass
+        return {"counts": counts,
                 "recent_evaluations": data["evaluations"][:5], "recent_deployments": data["deployments"][:5],
-                "model_scores": [{"name": m["name"], "score": round(sum(m["scores"]) / 5, 1)} for m in data["models"]],
+                "model_scores": [{"name": m["name"], "score": round(sum(m["scores"]) / len(m["scores"]), 1)}
+                                 for m in data["models"] if m.get("scores")],
                 "demo": demo}
 
     @app.get("/api/models", dependencies=[Depends(authorized)])
     def models():
-        return store.snapshot()["models"]
+        return [registry.public(model) for model in registry.list_models()]
 
     @app.post("/api/models", status_code=201, dependencies=[Depends(authorized)])
     def create_model(body: ModelInput):
-        if any(x < 0 or x > 100 for x in body.scores):
-            raise HTTPException(422, "能力分必须在 0–100 之间")
-        def op(data):
-            item = {"id": uid("model"), **body.model_dump(), "status": "ready"}
-            data["models"].append(item)
-            return item
-        return store.update(op)
+        return registry.save(body)
 
-    @app.put("/api/models/{model_id}", dependencies=[Depends(authorized)])
+    @app.put("/api/models/{model_id:path}", dependencies=[Depends(authorized)])
     def update_model(model_id: str, body: ModelInput):
-        if any(x < 0 or x > 100 for x in body.scores):
-            raise HTTPException(422, "能力分必须在 0–100 之间")
-        return store.update(lambda d: find(d["models"], model_id).update(body.model_dump()) or find(d["models"], model_id))
+        return registry.save(body, model_id)
 
-    @app.delete("/api/models/{model_id}", dependencies=[Depends(authorized)])
+    @app.delete("/api/models/{model_id:path}", dependencies=[Depends(authorized)])
     def delete_model(model_id: str):
         def op(data):
             find(data["models"], model_id)
@@ -256,14 +254,14 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
                    "VLM": [0.1, 0.1, 0.1, 0.6, 0.1], "Arena": [0.25, 0.25, 0.25, 0.15, 0.1]}[board]
         rows = [{"id": m["id"], "name": m["name"], "provider": m["provider"],
                  "score": round(sum(a * b for a, b in zip(m["scores"], weights)), 1), "scores": m["scores"]}
-                for m in store.snapshot()["models"]]
+                for m in store.snapshot()["models"] if len(m.get("scores", [])) == 5]
         rows.sort(key=lambda m: m["score"], reverse=True)
         return {"board": board, "rows": [{**m, "rank": i + 1} for i, m in enumerate(rows)], "simulated": True}
 
     @app.get("/api/recommendations", dependencies=[Depends(authorized)])
     def recommendations(scenario: Literal["language", "code", "reasoning", "vision", "telecom"] = "language"):
         index = {"language": 0, "code": 2, "reasoning": 1, "vision": 3, "telecom": 4}[scenario]
-        models = store.snapshot()["models"]
+        models = [m for m in store.snapshot()["models"] if len(m.get("scores", [])) == 5]
         return {"scenario": scenario, "rows": sorted(models, key=lambda m: m["scores"][index], reverse=True)[:3], "simulated": True}
 
     @app.get("/api/deployments", dependencies=[Depends(authorized)])
@@ -272,8 +270,8 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
 
     @app.post("/api/deployments", status_code=201, dependencies=[Depends(authorized)])
     def create_deployment(body: DeploymentInput):
+        model = registry.get_model(body.model_id)
         def op(data):
-            model = find(data["models"], body.model_id)
             item = {"id": uid("deployment"), **body.model_dump(), "model_name": model["name"], "status": "pending",
                     "created_at": now(), "simulated": True}
             data["deployments"].insert(0, item)
@@ -383,8 +381,9 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
 
     @app.post("/api/evaluations", status_code=201, dependencies=[Depends(authorized)])
     def create_evaluation(body: EvalInput):
+        model = registry.get_model(body.model_id)
         def op(data):
-            model, dataset = find(data["models"], body.model_id), find(data["datasets"], body.dataset_id)
+            dataset = find(data["datasets"], body.dataset_id)
             item = {"id": uid("eval"), **body.model_dump(), "model_name": model["name"], "dataset_name": dataset["name"],
                     "status": "queued", "progress": 0, "created_at": now(), "updated_at": now(), "logs": [f"{now()} 任务已提交"],
                     "report_id": None, "simulated": True}
@@ -396,9 +395,9 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
     def create_batch_evaluations(body: BatchEvalInput):
         if len(set(body.model_ids)) != len(body.model_ids):
             raise HTTPException(422, "模型不能重复")
+        models = [registry.get_model(identifier) for identifier in body.model_ids]
         def op(data):
             dataset = find(data["datasets"], body.dataset_id)
-            models = [find(data["models"], identifier) for identifier in body.model_ids]
             created = []
             for model in models:
                 task = {"id": uid("eval"), "model_id": model["id"], "dataset_id": dataset["id"],
@@ -479,30 +478,89 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
 
     @app.post("/api/agents/chat/stream", dependencies=[Depends(authorized)])
     async def chat(body: ChatInput):
-        configured = bool(os.getenv("LLM_BASE_URL") and os.getenv("LLM_MODEL"))
+        model = await asyncio.to_thread(registry.get_model, body.model_id)
+        endpoint = registry.next_endpoint(model)
+        api_key = registry.api_key(endpoint)
+        endpoint_url = endpoint["url"]
+        url = endpoint_url if endpoint_url.endswith("/chat/completions") else endpoint_url.rstrip("/") + "/chat/completions"
+        messages = [{"role": item["role"], "content": item["content"][:8000]}
+                    for item in body.history[-20:]
+                    if item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str)]
+        messages.append({"role": "user", "content": body.message})
+        payload = {
+            "model": model["id"], "messages": messages, "stream": True,
+            "top_p": body.top_p if body.top_p is not None else endpoint["top_p"],
+            "temperature": body.temperature if body.temperature is not None else endpoint["temperature"],
+        }
+        if model.get("provider", "").lower() != "deepseek" or endpoint.get("self_deployed"):
+            payload["top_k"] = body.top_k if body.top_k is not None else endpoint["top_k"]
+        schema = endpoint.get("thinking_schema") or {}
+        payload.update(schema.get("enabled" if body.thinking else "disabled", {}))
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        def event(name: str, data: dict) -> str:
+            return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
         async def stream():
-            if configured:
-                messages = [{"role": "system", "content": "你是 InnovationCore 平台助手。请准确、简洁地回答。"}]
-                messages.extend({"role": item.get("role"), "content": item.get("content", "")[:4000]}
-                                for item in body.history[-12:] if item.get("role") in ("user", "assistant"))
-                messages.append({"role": "user", "content": body.message})
+            produced = False
+            for attempt in range(3):
                 try:
-                    async with httpx.AsyncClient(timeout=90) as client:
-                        reply = await client.post(os.getenv("LLM_BASE_URL").rstrip("/") + "/chat/completions",
-                            headers={"Authorization": "Bearer " + os.getenv("LLM_API_KEY", "EMPTY")},
-                            json={"model": os.getenv("LLM_MODEL"), "messages": messages, "stream": False})
-                        reply.raise_for_status()
-                        answer = reply.json()["choices"][0]["message"]["content"]
-                except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
-                    yield f"event: error\ndata: {json.dumps({'message': 'LLM 服务调用失败', 'detail': str(exc)[:200]}, ensure_ascii=False)}\n\n"
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=20)) as client:
+                        async with client.stream("POST", url, headers=headers, json=payload) as upstream:
+                            if upstream.status_code >= 400:
+                                yield event("error", {"message": f"模型服务返回 HTTP {upstream.status_code}"})
+                                return
+                            if "application/json" in upstream.headers.get("content-type", ""):
+                                try:
+                                    message = (await upstream.aread())
+                                    message = json.loads(message)["choices"][0]["message"]
+                                    if message.get("reasoning_content"):
+                                        produced = True
+                                        yield event("reasoning", {"text": message["reasoning_content"]})
+                                    if message.get("content"):
+                                        produced = True
+                                        yield event("chunk", {"text": message["content"]})
+                                except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                                    yield event("error", {"message": "模型服务返回了无法解析的响应"})
+                                    return
+                                break
+                            async for line in upstream.aiter_lines():
+                                if not line.startswith("data:"):
+                                    continue
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    packet = json.loads(data)
+                                    if packet.get("error"):
+                                        yield event("error", {"message": "模型服务返回错误"})
+                                        return
+                                    delta = packet.get("choices", [{}])[0].get("delta", {})
+                                except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                                    continue
+                                reasoning = delta.get("reasoning_content")
+                                content = delta.get("content")
+                                if reasoning:
+                                    produced = True
+                                    yield event("reasoning", {"text": reasoning})
+                                if content:
+                                    produced = True
+                                    yield event("chunk", {"text": content})
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError):
+                    if produced or attempt == 2:
+                        yield event("error", {"message": "连接模型服务失败，请检查端点 URL 和网络"})
+                        return
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                except httpx.HTTPError:
+                    yield event("error", {"message": "模型服务连接中断"})
                     return
-            else:
-                answer = ("[演示回复] 我收到了你的问题：" + body.message[:180] +
-                          "。当前尚未配置模型服务；设置 LLM_BASE_URL、LLM_API_KEY 和 LLM_MODEL 后可获得真实回复。")
-            for i in range(0, len(answer), 18):
-                yield "event: chunk\ndata: " + json.dumps({"text": answer[i:i + 18], "simulated": not configured}, ensure_ascii=False) + "\n\n"
-                await asyncio.sleep(0.04)
-            yield "event: done\ndata: {}\n\n"
+            if not produced:
+                yield event("error", {"message": "模型服务未返回内容"})
+                return
+            yield event("done", {})
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/api/school/jobs", dependencies=[Depends(authorized)])
@@ -520,7 +578,7 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
 
     @app.post("/api/school/infer", dependencies=[Depends(authorized)])
     def infer(body: InferenceInput):
-        model = find(store.snapshot()["models"], body.model_id)
+        model = registry.get_model(body.model_id)
         return {"model": model["name"], "zone": body.zone, "output": f"[模拟推理] {model['name']} 收到输入：{body.prompt[:200]}",
                 "tokens": len(body.prompt), "simulated": True}
 
