@@ -44,16 +44,18 @@ npm run dev
 
 | 业务域 | 已实现 | 当前模拟或适配点 |
 | --- | --- | --- |
-| MaaS | 模型增删改查、能力对比、榜单、场景推荐、部署申请/审批 | 榜单初始值为示例数据；实际模型部署审批不调用集群 |
+| MaaS | DeepSeek 实时模型目录、模型注册与多 API 端点管理、部署申请/审批 | 榜单与推荐仍依赖本地评分记录；实际模型部署审批不调用集群 |
 | 数据与评测 | 数据集登记、文件上传下载、人工标注记录、治理统计、单模型/多模型评测创建、暂停/恢复/取消、SSE 进度日志、报告预览与发布状态 | 评分任务使用定时模拟执行器，未调用 Ruler1/2/VLM 真正评测脚本；VLA 统计待接入 |
-| Agent | SSE 对话、论文搜索与工具工作台 | 论文目录及辅助工具是示例结果；设置 `LLM_BASE_URL` 和 `LLM_API_KEY` 后聊天可调用兼容 OpenAI Chat Completions 的服务 |
+| Agent | 注册模型的真实 SSE 对话、双模型对战、论文搜索与工具工作台 | 论文目录及辅助工具仍是示例结果 |
 | AI School | 架构浏览、训练任务提交、日志/进度、推理沙箱、监控 WebSocket | 训练脚本只保存文本且**不执行**；推理和设备指标为演示数据 |
 
-用户创建的模型、任务、数据集、部署申请、报告存储在 `backend/data/platform.json`；上传的文件在 `backend/data/uploads/`。首次启动自动填入示例数据。单机单进程运行；JSON 存储与进程内执行器不适合多进程或生产集群。需集群部署时，应将 `Store` 换为数据库，并将评测/训练执行器换为队列和实际服务适配器。
+用户创建的模型配置（含 API Key）、任务、数据集、部署申请、报告存储在本地 `backend/data/platform.json`；上传的文件在 `backend/data/uploads/`。这两个路径已被 Git 忽略。单机单进程运行；JSON 存储与进程内执行器不适合多进程或生产集群。需集群部署时，应将 `Store` 换为数据库，并将评测/训练执行器换为队列和实际服务适配器。
 
 ## 环境变量
 
-复制 `backend/.env.example` 中的值到系统环境。代码使用系统环境变量，不自动加载 `.env` 文件。开发默认开启 `DEMO_MODE=true`。生产应将其设为 `false`，并设置 `INNOVATION_ADMIN_USER`、`INNOVATION_ADMIN_PASSWORD`、`INNOVATION_SECRET_KEY`（至少 32 字符）、`CORS_ORIGINS`。认证采用签名 Bearer Token；HTTPS/TLS 在反向代理处配置。WebSocket 握手通过首条消息验证 Token，避免将凭证写进 URL。
+可参考 `backend/.env.example`，将实际配置放入仓库根目录 `.env` 或系统环境变量。后端启动时自动读取根目录 `.env`。`DEEPSEEK_API_KEY` 用于发现当前账号可用的 DeepSeek 模型并调用对话 API。开发默认开启 `DEMO_MODE=true`。生产应将其设为 `false`，并设置 `INNOVATION_ADMIN_USER`、`INNOVATION_ADMIN_PASSWORD`、`INNOVATION_SECRET_KEY`（至少 32 字符）、`CORS_ORIGINS`。认证采用签名 Bearer Token；HTTPS/TLS 在反向代理处配置。WebSocket 握手通过首条消息验证 Token，避免将凭证写进 URL。
+
+模型广场可注册兼容 OpenAI Chat Completions 的服务。每个模型可配置多个 API 端点，调用时依次轮询。端点的思考 Schema 使用 `{"enabled":{"thinking":{"type":"enabled"}},"disabled":{"thinking":{"type":"disabled"}}}` 这样的 JSON；`enabled` 和 `disabled` 分别是开启和关闭思考时附加到请求体的字段。编辑模型时 API Key 输入框留空会沿用同一 URL 的已有密钥；模型 ID 注册后不可修改。
 
 **单端口运行**：先在 `frontend` 执行 `npm run build`，然后在 `backend` 执行 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8081`，访问 http://localhost:8081 。FastAPI 自动托管已构建的前端，API 仍在 `/api`，WebSocket 在 `/ws`。此方式在 Windows 和 Linux 命令一致。Linux 生产也可由 Nginx 托管 `frontend/dist` 并反代 `/api`、`/ws` 到 8081；Windows 可用 IIS 或其他反向代理。跨机器访问时将 Uvicorn 的 `--host` 设为 `0.0.0.0`，配合防火墙、HTTPS 与认证使用。`VITE_API_BASE` 默认 `/api`，从子路径或跨域部署时需自行配置对应代理。
 

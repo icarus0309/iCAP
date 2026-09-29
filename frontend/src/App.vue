@@ -35,12 +35,12 @@ function signOut() { auth.logout(); router.push('/login') }
           </router-link>
         </div>
       </div>
-      <div class="sidebar-footer"><span class="signal" /> 系统运行中 <span class="sidebar-version">v0.1 demo</span></div>
+      <div class="sidebar-footer"><span class="signal" /> 系统运行中 <span class="sidebar-version">v0.1</span></div>
     </aside>
     <div class="workspace">
       <header class="topbar">
         <div class="top-left"><button class="menu-button" @click="mobileNav = true">☰</button><span class="crumb">{{ route.meta.group || '工作台' }} <b>/</b> <strong>{{ route.meta.title }}</strong></span></div>
-        <div class="top-right"><span class="demo-pill">演示环境</span><span class="avatar">{{ auth.username?.slice(0, 1).toUpperCase() || 'A' }}</span><span class="user-name">{{ auth.username || 'admin' }}</span><el-button text @click="signOut">退出</el-button></div>
+        <div class="top-right"><span class="avatar">{{ auth.username?.slice(0, 1).toUpperCase() || 'A' }}</span><span class="user-name">{{ auth.username || 'admin' }}</span><el-button text @click="signOut">退出</el-button></div>
       </header>
       <main class="page"><router-view /></main>
     </div>

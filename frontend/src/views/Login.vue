@@ -5,7 +5,7 @@ import { useAuth } from '../stores/auth'
 
 const router = useRouter()
 const auth = useAuth()
-const form = reactive({ username: 'admin', password: 'demo1234' })
+const form = reactive({ username: '', password: '' })
 const busy = ref(false)
 async function submit() {
   busy.value = true
@@ -19,7 +19,7 @@ async function submit() {
       <div class="login-content"><div class="login-kicker">ENTERPRISE AI PLATFORM</div><h1>让每一次模型创新<br />都有迹可循。</h1><p>模型服务化 · 数据与评测 · Agent 应用 · AI 实训</p><div class="login-lines"><span>01 / 接入</span><span>02 / 评测</span><span>03 / 应用</span></div></div>
       <div class="login-bottom">INNOVATIONCORE / AI PLATFORM</div>
     </div>
-    <div class="login-form-wrap"><div class="login-form"><div class="eyebrow">WELCOME BACK</div><h2>登录平台</h2><p class="subtitle">探索企业级 AI 创新工作台</p><el-form :model="form" label-position="top" @submit.prevent="submit"><el-form-item label="用户名"><el-input v-model="form.username" autocomplete="username" placeholder="请输入用户名" size="large" /></el-form-item><el-form-item label="密码"><el-input v-model="form.password" autocomplete="current-password" placeholder="请输入密码" type="password" show-password size="large" @keyup.enter="submit" /></el-form-item><el-button type="primary" size="large" class="login-button" :loading="busy" @click="submit">进入工作台 →</el-button></el-form><div class="login-hint">演示账号：admin / demo1234<br />真实系统请通过环境变量更换账号和签名密钥。</div></div></div>
+    <div class="login-form-wrap"><div class="login-form"><div class="eyebrow">WELCOME BACK</div><h2>登录平台</h2><p class="subtitle">探索企业级 AI 创新工作台</p><el-form :model="form" label-position="top" @submit.prevent="submit"><el-form-item label="用户名"><el-input v-model="form.username" autocomplete="username" placeholder="请输入用户名" size="large" /></el-form-item><el-form-item label="密码"><el-input v-model="form.password" autocomplete="current-password" placeholder="请输入密码" type="password" show-password size="large" @keyup.enter="submit" /></el-form-item><el-button type="primary" size="large" class="login-button" :loading="busy" @click="submit">进入工作台 →</el-button></el-form></div></div>
   </div>
 </template>
 <style scoped>
