@@ -16,6 +16,8 @@ def endpoint(url="http://127.0.0.1:9001/v1", api_key="local-secret"):
 
 def client_with_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    monkeypatch.setenv("INNOVATION_ADMIN_USER", "admin")
+    monkeypatch.setenv("INNOVATION_ADMIN_PASSWORD", "demo1234")
     client = TestClient(create_app(tmp_path, demo=True))
     response = client.post("/api/auth/login", json={"username": "admin", "password": "demo1234"})
     assert response.status_code == 200
@@ -25,6 +27,15 @@ def client_with_auth(tmp_path, monkeypatch):
             "provider": "本地", "endpoints": [endpoint()]})
         assert response.status_code == 201
     return client
+
+
+def test_login_rejects_unicode_credentials_without_server_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("INNOVATION_ADMIN_USER", "admin")
+    monkeypatch.setenv("INNOVATION_ADMIN_PASSWORD", "secret")
+    with TestClient(create_app(tmp_path, demo=True)) as client:
+        for username, password in (("错误用户名", "secret"), ("admin", "错误密码")):
+            response = client.post("/api/auth/login", json={"username": username, "password": password})
+            assert response.status_code == 401
 
 
 def test_model_dataset_file_and_auth(tmp_path, monkeypatch):
@@ -162,6 +173,8 @@ def test_model_endpoints_round_robin_and_real_stream_contract(tmp_path, monkeypa
 
 def test_deepseek_model_edit_keeps_key_server_side(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-secret")
+    monkeypatch.setenv("INNOVATION_ADMIN_USER", "admin")
+    monkeypatch.setenv("INNOVATION_ADMIN_PASSWORD", "demo1234")
 
     class CatalogResponse:
         def raise_for_status(self):
@@ -194,3 +207,15 @@ def test_deepseek_model_edit_keeps_key_server_side(tmp_path, monkeypatch):
         assert edited.status_code == 200
         assert edited.json()["endpoints"][0]["has_api_key"] is False
         assert "key_env" not in app.state.store.snapshot()["models"][0]["endpoints"][0]
+
+
+def test_recommendations_never_return_model_api_keys(tmp_path, monkeypatch):
+    with client_with_auth(tmp_path, monkeypatch) as client:
+        def add_scores(data):
+            data["models"][0]["scores"] = [80, 75, 90, 70, 85]
+
+        client.app.state.store.update(add_scores)
+        response = client.get("/api/recommendations?scenario=language")
+        assert response.status_code == 200
+        assert response.json()["rows"]
+        assert "local-secret" not in response.text

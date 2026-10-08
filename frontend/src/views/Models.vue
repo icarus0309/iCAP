@@ -4,6 +4,8 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 import ModelLogo from '../components/ModelLogo.vue'
+import VisibilityField from '../components/VisibilityField.vue'
+import VisibilityTag from '../components/VisibilityTag.vue'
 
 const router = useRouter()
 const models = ref([])
@@ -22,12 +24,13 @@ function emptyEndpoint() {
     max_context_length: 32768, top_k: 40, top_p: 1, temperature: 1 }
 }
 function emptyModel() {
-  return { id: '', name: '', provider: '', logo_url: '', endpoints: [emptyEndpoint()] }
+  return { id: '', name: '', provider: '', logo_url: '', visibility: 'private', endpoints: [emptyEndpoint()] }
 }
 function edit(model) {
   editingId.value = model?.id || null
   form.value = model ? {
     id: model.id, name: model.name, provider: model.provider, logo_url: model.logo_url || '',
+    visibility: model.visibility || 'private',
     endpoints: (model.endpoints.length ? model.endpoints : [emptyEndpoint()]).map(endpoint => ({
       ...endpoint, api_key: '',
       thinking_schema: endpoint.thinking_schema && Object.keys(endpoint.thinking_schema).length
@@ -43,7 +46,8 @@ async function load() {
 }
 async function save() {
   const body = { id: form.value.id.trim(), name: form.value.name.trim(),
-    provider: form.value.provider.trim(), logo_url: form.value.logo_url.trim(), endpoints: [] }
+    provider: form.value.provider.trim(), logo_url: form.value.logo_url.trim(),
+    visibility: form.value.visibility, endpoints: [] }
   if (!body.id || !body.name || !body.provider) return ElMessage.warning('请填写模型 ID、名称和厂商')
   for (const [index, item] of form.value.endpoints.entries()) {
     if (!item.url.trim()) return ElMessage.warning(`请填写端点 ${index + 1} 的 URL`)
@@ -84,9 +88,9 @@ onMounted(load)
   <div v-if="filtered.length" class="grid three">
     <div v-for="model in filtered" :key="model.id" class="card model-card">
       <div class="model-top"><ModelLogo :model="model" /><div class="model-title"><div class="model-name">{{ model.name }}</div><div class="model-provider">{{ model.provider }} · {{ model.id }}</div></div></div>
-      <div class="model-meta"><span class="chip">{{ model.modality }}</span><el-tag size="small" type="info">{{ model.endpoints.length }} 个 API 端点</el-tag></div>
+      <div class="model-meta"><span class="chip">{{ model.modality }}</span><VisibilityTag :visibility="model.visibility" /><el-tag size="small" type="info">{{ model.endpoints.length }} 个 API 端点</el-tag></div>
       <div class="model-detail">最大上下文 {{ model.context_length?.toLocaleString() || '—' }} tokens</div>
-      <div class="model-actions"><el-button text @click="edit(model)">编辑配置</el-button><el-button type="primary" @click="tryModel(model)">立即体验</el-button></div>
+      <div class="model-actions"><el-button v-if="model.can_edit !== false" text @click="edit(model)">编辑配置</el-button><el-button type="primary" @click="tryModel(model)">立即体验</el-button></div>
     </div>
   </div>
   <div v-else-if="!loading" class="card empty">{{ keyword ? '没有匹配的模型' : '暂无模型，请注册模型服务' }}</div>
@@ -99,6 +103,8 @@ onMounted(load)
         <el-form-item label="厂商"><el-input v-model="form.provider" maxlength="60" /></el-form-item>
         <el-form-item label="Logo URL（选填）"><el-input v-model="form.logo_url" placeholder="https://..." /></el-form-item>
       </div>
+      <VisibilityField v-model="form.visibility" />
+      <div v-if="form.visibility === 'public'" class="field-hint">其他登录用户可以使用这个模型对话，调用可能产生 API 费用。</div>
       <div class="endpoint-heading"><h3>API 端点</h3><el-button @click="form.endpoints.push(emptyEndpoint())">+ 添加端点</el-button></div>
       <div v-for="(endpoint, index) in form.endpoints" :key="endpoint.endpoint_id || index" class="endpoint-box">
         <div class="endpoint-title"><strong>端点 {{ index + 1 }}</strong><el-button v-if="form.endpoints.length > 1" text type="danger" @click="form.endpoints.splice(index, 1)">移除</el-button></div>
@@ -124,7 +130,7 @@ onMounted(load)
 .model-title { min-width:0; }
 .model-name { overflow-wrap:anywhere; }
 .model-provider { overflow-wrap:anywhere; }
-.model-meta { margin:18px 0 8px; }
+.model-meta { margin:18px 0 8px; flex-wrap:wrap; }
 .model-detail { color:var(--muted); font-size:12px; }
 .model-actions { margin-top:auto; padding-top:20px; display:flex; justify-content:flex-end; gap:6px; }
 .form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 16px; }

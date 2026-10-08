@@ -1,7 +1,11 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 const routes = [
-  { path: '/login', component: () => import('./views/Login.vue'), meta: { title: '登录' } },
+  { path: '/login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
+  { path: '/register', component: () => import('./views/Register.vue'), meta: { title: '注册', public: true } },
+  { path: '/password/reset', component: () => import('./views/PasswordSecurity.vue'), meta: { title: '找回密码', public: true } },
+  { path: '/password/change', component: () => import('./views/PasswordSecurity.vue'), meta: { title: '修改密码', public: true, requiresAuth: true } },
+  { path: '/security-questions/setup', component: () => import('./views/SecurityQuestionsSetup.vue'), meta: { title: '设置密保问题', public: true, requiresAuth: true } },
   { path: '/', component: () => import('./views/Overview.vue'), meta: { title: '平台概览', group: '总览' } },
   { path: '/models', component: () => import('./views/Models.vue'), meta: { title: '模型广场与选型', group: 'MaaS 服务' } },
   { path: '/leaderboard', component: () => import('./views/Leaderboard.vue'), meta: { title: '模型榜单', group: 'MaaS 服务' } },
@@ -18,8 +22,8 @@ const routes = [
 
 const router = createRouter({ history: createWebHistory(), routes })
 router.beforeEach((to) => {
-  if (to.path !== '/login' && !localStorage.getItem('ic_token')) return '/login'
-  if (to.path === '/login' && localStorage.getItem('ic_token')) return '/'
+  if ((!to.meta.public || to.meta.requiresAuth) && !localStorage.getItem('ic_token')) return { path: '/login', query: { redirect: to.fullPath } }
+  if (to.meta.public && !to.meta.requiresAuth && localStorage.getItem('ic_token')) return '/'
   document.title = `${to.meta.title} · InnovationCore AI`
 })
 export default router
