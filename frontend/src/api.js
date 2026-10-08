@@ -6,15 +6,19 @@ export const api = axios.create({ baseURL: base, timeout: 30000 })
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('ic_token')
-  if (token) config.headers.Authorization = `Bearer ${token}`
+  if (token && !config.publicAuth) config.headers.Authorization = `Bearer ${token}`
   return config
 })
 api.interceptors.response.use((response) => response.data, (error) => {
   const detail = error.response?.data?.detail
-  ElMessage.error(typeof detail === 'string' ? detail : '请求失败，请检查后端服务')
-  if (error.response?.status === 401 && !location.pathname.startsWith('/login')) {
+  if (!error.config?.silentError) ElMessage.error(typeof detail === 'string' ? detail : '请求失败，请检查后端服务')
+  const onAuthPage = ['/login', '/register', '/password/reset'].includes(location.pathname)
+  if (error.response?.status === 401 && !onAuthPage && !error.config?.publicAuth && !error.config?.skipAuthRedirect) {
     localStorage.removeItem('ic_token')
-    location.assign('/login')
+    localStorage.removeItem('ic_user')
+    localStorage.removeItem('ic_user_id')
+    localStorage.removeItem('ic_role')
+    location.assign(`/login?redirect=${encodeURIComponent(location.pathname + location.search)}`)
   }
   return Promise.reject(error)
 })

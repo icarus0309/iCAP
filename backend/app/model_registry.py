@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import uuid
+from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -58,6 +59,7 @@ class ModelInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     provider: str = Field(min_length=1, max_length=60)
     logo_url: str = Field(default="", max_length=2048)
+    visibility: Literal["private", "public"] = "private"
     endpoints: list[EndpointInput] = Field(min_length=1, max_length=20)
 
     @field_validator("id", "name", "provider")
@@ -124,6 +126,8 @@ class ModelRegistry:
                 "provider": "DeepSeek",
                 "logo_url": "",
                 "source": "DeepSeek API",
+                "owner_user_id": None,
+                "visibility": "public",
                 "input_modalities": inputs,
                 "output_modalities": item.get("output_modalities") or ["text"],
                 "max_output_tokens": item.get("max_output_tokens"),
@@ -146,7 +150,24 @@ class ModelRegistry:
             self._catalog_at = time.monotonic()
         return models
 
-    def list_models(self) -> list[dict]:
+    @staticmethod
+    def can_view(model: dict, actor: dict | None = None) -> bool:
+        if actor is None or actor.get("role") == "admin":
+            return True
+        return model.get("visibility", "public") == "public" or model.get("owner_user_id") == actor.get("id")
+
+    @staticmethod
+    def can_edit(model: dict, actor: dict | None = None) -> bool:
+        if actor is None or actor.get("role") == "admin":
+            return True
+        return bool(model.get("owner_user_id")) and model.get("owner_user_id") == actor.get("id")
+
+    @classmethod
+    def require_edit(cls, model: dict, actor: dict | None = None) -> None:
+        if not cls.can_edit(model, actor):
+            raise HTTPException(403, "无权修改此模型")
+
+    def list_models(self, actor: dict | None = None) -> list[dict]:
         stored = self.store.snapshot()["models"]
         try:
             remote = self._remote_models()
@@ -157,19 +178,23 @@ class ModelRegistry:
         by_id = {model["id"]: model for model in remote}
         for model in stored:
             by_id[model["id"]] = {**by_id.get(model["id"], {}), **model}
-        return list(by_id.values())
+        return [model for model in by_id.values() if self.can_view(model, actor)]
 
-    def get_model(self, model_id: str) -> dict:
+    def get_model(self, model_id: str, actor: dict | None = None) -> dict:
         stored = next((item for item in self.store.snapshot()["models"] if item["id"] == model_id), None)
         if stored and stored.get("endpoints"):
+            if not self.can_view(stored, actor):
+                raise HTTPException(404, "模型不存在")
             return stored
-        model = next((item for item in self.list_models() if item["id"] == model_id), None)
+        model = next((item for item in self.list_models(actor) if item["id"] == model_id), None)
         if model is None:
             raise HTTPException(404, "模型不存在")
         return model
 
     @staticmethod
-    def public(model: dict) -> dict:
+    def public(model: dict, actor: dict | None = None) -> dict:
+        if not ModelRegistry.can_view(model, actor):
+            raise HTTPException(404, "模型不存在")
         result = {key: copy.deepcopy(value) for key, value in model.items() if key != "endpoints"}
         result["endpoints"] = []
         for endpoint in model.get("endpoints", []):
@@ -180,9 +205,13 @@ class ModelRegistry:
             result["endpoints"].append(visible)
         result["context_length"] = max((item["max_context_length"] for item in result["endpoints"]), default=0)
         result["modality"] = "多模态" if any(m in ("image", "audio", "video") for m in result.get("input_modalities", [])) else "文本"
+        result["visibility"] = model.get("visibility", "public")
+        result["owner_user_id"] = model.get("owner_user_id")
+        if actor is not None:
+            result["can_edit"] = ModelRegistry.can_edit(model, actor)
         return result
 
-    def save(self, body: ModelInput, original_id: str | None = None) -> dict:
+    def save(self, body: ModelInput, original_id: str | None = None, actor: dict | None = None) -> dict:
         if original_id is not None and body.id != original_id:
             raise HTTPException(422, "模型 ID 注册后不可修改")
         try:
@@ -196,6 +225,8 @@ class ModelRegistry:
             raise HTTPException(409, "模型 ID 已存在")
         if original_id is not None and existing is None:
             raise HTTPException(404, "模型不存在")
+        if original_id is not None:
+            self.require_edit(existing, actor)
         old_endpoints = {e["endpoint_id"]: e for e in (existing or {}).get("endpoints", [])}
         endpoints = []
         seen = set()
@@ -213,12 +244,21 @@ class ModelRegistry:
             endpoint["endpoint_id"] = endpoint_id
             endpoints.append(endpoint)
 
+        if existing is not None and "visibility" not in body.model_fields_set:
+            visibility = existing.get("visibility", "public")
+        elif "visibility" in body.model_fields_set:
+            visibility = body.visibility
+        else:
+            visibility = "public" if actor is None else "private"
+
         record = {
             "id": body.id,
             "name": body.name,
             "provider": body.provider,
             "logo_url": body.logo_url,
             "source": (existing or {}).get("source", "用户注册"),
+            "owner_user_id": existing.get("owner_user_id") if existing is not None else (actor or {}).get("id"),
+            "visibility": visibility,
             "endpoints": endpoints,
             "scores": (existing or {}).get("scores", []),
         }
@@ -231,10 +271,26 @@ class ModelRegistry:
             if index is None:
                 rows.append(record)
             else:
+                self.require_edit(rows[index], actor)
                 rows[index] = record
             return record
 
-        return self.public(self.store.update(op))
+        return self.public(self.store.update(op), actor)
+
+    def delete(self, model_id: str, actor: dict | None = None) -> dict:
+        def op(data: dict) -> dict:
+            rows = data["models"]
+            model = next((item for item in rows if item["id"] == model_id), None)
+            if model is None:
+                raise HTTPException(404, "模型不存在")
+            self.require_edit(model, actor)
+            if any(item["model_id"] == model_id for item in
+                   data["evaluations"] + data["deployments"] + data["school_jobs"]):
+                raise HTTPException(409, "模型已被任务或申请引用")
+            data["models"] = [item for item in rows if item["id"] != model_id]
+            return {"deleted": model_id}
+
+        return self.store.update(op)
 
     def next_endpoint(self, model: dict) -> dict:
         endpoints = model.get("endpoints") or []

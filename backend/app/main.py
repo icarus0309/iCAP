@@ -19,12 +19,14 @@ from typing import Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .access import Visibility, can_view, ownership, require_edit, require_view, visible
+from .auth import AuthService, source_ip
 from .model_registry import ModelInput, ModelRegistry
 from .store import Store
 
@@ -47,8 +49,40 @@ def find(items: list[dict], identifier: str) -> dict:
 
 
 class Login(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=254)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class SecurityQuestionInput(BaseModel):
+    question: str = Field(min_length=1, max_length=120)
+    answer: str = Field(min_length=1, max_length=128)
+
+
+class Register(BaseModel):
+    username: str = Field(min_length=1, max_length=32)
+    phone: str = Field(min_length=1, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+    security_questions: list[SecurityQuestionInput] = Field(min_length=3, max_length=3)
+
+
+class SecurityQuestionsInput(BaseModel):
+    security_questions: list[SecurityQuestionInput] = Field(min_length=3, max_length=3)
+
+
+class SecurityAnswerInput(BaseModel):
+    index: int = Field(ge=0, le=2)
+    answer: str = Field(min_length=1, max_length=128)
+
+
+class PasswordReset(BaseModel):
+    username: str = Field(min_length=1, max_length=254)
+    new_password: str = Field(min_length=8, max_length=128)
+    answers: list[SecurityAnswerInput] = Field(min_length=2, max_length=3)
+
+
+class PasswordChange(BaseModel):
+    new_password: str = Field(min_length=8, max_length=128)
+    answers: list[SecurityAnswerInput] = Field(min_length=2, max_length=3)
 
 
 class DatasetInput(BaseModel):
@@ -56,30 +90,35 @@ class DatasetInput(BaseModel):
     category: str = Field(default="通用", max_length=40)
     version: str = Field(default="v1.0", max_length=30)
     description: str = Field(default="", max_length=500)
+    visibility: Visibility = "private"
 
 
 class EvalInput(BaseModel):
     model_id: str
     dataset_id: str
     benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Dev", "ASR", "MT", "TTS"] = "Ruler1"
+    visibility: Visibility = "private"
 
 
 class BatchEvalInput(BaseModel):
     model_ids: list[str] = Field(min_length=1, max_length=4)
     dataset_id: str
     benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Dev", "ASR", "MT", "TTS"] = "Ruler1"
+    visibility: Visibility = "private"
 
 
 class AnnotationInput(BaseModel):
     dataset_id: str
     content: str = Field(min_length=1, max_length=8000)
     label: str = Field(min_length=1, max_length=80)
+    visibility: Visibility = "private"
 
 
 class DeploymentInput(BaseModel):
     model_id: str
     reason: str = Field(min_length=3, max_length=500)
     hardware: str = Field(default="910B", max_length=60)
+    visibility: Visibility = "private"
 
 
 class Decision(BaseModel):
@@ -94,6 +133,7 @@ class SchoolJobInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     accelerator: Literal["NPU", "GPU"] = "NPU"
     script: str = Field(min_length=1, max_length=20000)
+    visibility: Visibility = "private"
 
 
 class InferenceInput(BaseModel):
@@ -140,6 +180,8 @@ async def advance_jobs(store: Store, stop: asyncio.Event) -> None:
                             score = round(sum(scores) / len(scores), 1) if scores else 0
                             report = dict(id=uid("report"), evaluation_id=task["id"], title=f"{task['benchmark']} · {task['model_name']}",
                                           score=score, created_at=now(), published=False, simulated=True,
+                                          owner_user_id=task.get("owner_user_id"),
+                                          visibility=task.get("visibility", "public"),
                                           summary=f"演示评测报告：{task['model_name']} 在 {task['dataset_name']} 上得到示例分数 {score}。"
                                                   "未调用真实测评脚本，不能作为模型能力结论。")
                             data["reports"].insert(0, report)
@@ -160,6 +202,7 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
         raise RuntimeError("生产模式必须设置管理员账号、密码和至少 32 字符的签名密钥")
     base = Path(data_dir or os.getenv("INNOVATION_DATA_DIR", Path(__file__).resolve().parents[1] / "data"))
     store = Store(base)
+    auth = AuthService(base, secret, admin_user, admin_password, demo)
     registry = ModelRegistry(store)
     stop = asyncio.Event()
 
@@ -172,52 +215,115 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
 
     app = FastAPI(title="InnovationCore AI Platform", version="0.1.0", lifespan=lifespan)
     app.state.store = store
+    app.state.auth = auth
     origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
     app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in origins], allow_credentials=True,
                        allow_methods=["*"], allow_headers=["*"])
 
-    def encode_token(subject: str) -> str:
-        payload = base64.urlsafe_b64encode(json.dumps({"sub": subject, "exp": int(time.time()) + 28800}).encode()).rstrip(b"=")
-        signature = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
-        return f"{payload.decode()}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}"
+    @app.exception_handler(HTTPException)
+    def http_error(request: Request, exc: HTTPException):
+        body = {"detail": exc.detail}
+        if exc.status_code in (423, 429) and exc.headers and exc.headers.get("Retry-After"):
+            body["retry_after"] = int(exc.headers["Retry-After"])
+        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
 
-    def decode_token(token: str) -> str:
-        try:
-            payload, signature = token.split(".", 1)
-            actual = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()
-            expected = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
-            body = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-            if hmac.compare_digest(actual, expected) and body["exp"] > time.time() and body["sub"] == admin_user:
-                return body["sub"]
-        except (ValueError, KeyError, TypeError, binascii.Error, UnicodeDecodeError):
-            pass
-        raise HTTPException(401, "登录已失效，请重新登录")
-
-    def authorized(authorization: str | None = Header(default=None)) -> str:
+    def authorized(authorization: str | None = Header(default=None)) -> dict:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "请先登录")
-        return decode_token(authorization[7:])
+        return auth.current(authorization[7:])
+
+    def admin_authorized(principal: dict = Depends(authorized)) -> dict:
+        if principal["role"] != "admin":
+            raise HTTPException(403, "需要管理员权限")
+        return principal
+
+    def scoped_data(principal: dict) -> dict:
+        """Filter both records and their referenced resources before returning data."""
+        data = store.snapshot()
+        model_by_id = {row["id"]: row for row in data["models"]}
+        datasets = visible(data["datasets"], principal)
+        dataset_ids = {row["id"] for row in datasets}
+
+        def model_allowed(identifier: str) -> bool:
+            model = model_by_id.get(identifier)
+            # An unstored model is from the public provider catalog.
+            return model is None or can_view(model, principal)
+
+        evaluations = [row for row in data["evaluations"]
+                       if can_view(row, principal) and model_allowed(row["model_id"])
+                       and row["dataset_id"] in dataset_ids]
+        evaluation_ids = {row["id"] for row in evaluations}
+        return {
+            "models": [row for row in data["models"] if can_view(row, principal)],
+            "datasets": datasets,
+            "evaluations": evaluations,
+            "reports": [row for row in data["reports"] if can_view(row, principal)
+                        and row["evaluation_id"] in evaluation_ids],
+            "deployments": [row for row in data["deployments"] if can_view(row, principal)
+                            and model_allowed(row["model_id"])],
+            "school_jobs": visible(data["school_jobs"], principal),
+            "annotations": [row for row in data["annotations"] if can_view(row, principal)
+                            and row["dataset_id"] in dataset_ids],
+        }
 
     @app.get("/health")
     def health():
         return {"status": "ok", "demo": demo}
 
+    @app.post("/api/auth/register", status_code=201)
+    def register(body: Register, response: Response, request: Request):
+        response.headers["Cache-Control"] = "no-store"
+        return auth.register(body.username, body.phone, body.password,
+                             [item.model_dump() for item in body.security_questions], source_ip(request))
+
     @app.post("/api/auth/login")
-    def login(body: Login):
-        if not (secrets.compare_digest(body.username, admin_user) and secrets.compare_digest(body.password, admin_password)):
-            raise HTTPException(401, "用户名或密码错误")
-        return {"access_token": encode_token(body.username), "token_type": "bearer", "username": body.username, "demo": demo}
+    def login(body: Login, response: Response, request: Request):
+        response.headers["Cache-Control"] = "no-store"
+        return auth.login_password(body.username.strip(), body.password, source_ip(request))
 
-    @app.get("/api/auth/me", dependencies=[Depends(authorized)])
-    def me():
-        return {"username": admin_user, "demo": demo}
+    @app.get("/api/auth/security-questions")
+    def security_questions(username: str, request: Request, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return auth.get_security_questions(username, source_ip(request))
 
-    @app.get("/api/dashboard", dependencies=[Depends(authorized)])
-    def dashboard():
-        data = store.snapshot()
+    @app.put("/api/auth/security-questions")
+    def set_security_questions(body: SecurityQuestionsInput, response: Response,
+                               principal: dict = Depends(authorized)):
+        response.headers["Cache-Control"] = "no-store"
+        return auth.enroll_security_questions(
+            principal["id"], [item.model_dump() for item in body.security_questions])
+
+    @app.post("/api/auth/password/reset")
+    def reset_password(body: PasswordReset, request: Request, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return auth.reset_password(body.username, body.new_password,
+                                   [item.model_dump() for item in body.answers], source_ip(request))
+
+    @app.post("/api/auth/password/change")
+    def change_password(body: PasswordChange, request: Request, response: Response,
+                        principal: dict = Depends(authorized)):
+        response.headers["Cache-Control"] = "no-store"
+        if principal["role"] == "admin":
+            raise HTTPException(403, "管理员密码由服务配置管理")
+        return auth.reset_password(principal["username"], body.new_password,
+                                   [item.model_dump() for item in body.answers],
+                                   source_ip(request), expected_user_id=principal["id"])
+
+    @app.post("/api/auth/logout", status_code=204, dependencies=[Depends(authorized)])
+    def logout(authorization: str = Header()):
+        auth.logout(authorization[7:])
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/auth/me")
+    def me(principal: dict = Depends(authorized)):
+        return {**principal, "demo": demo}
+
+    @app.get("/api/dashboard")
+    def dashboard(principal: dict = Depends(authorized)):
+        data = scoped_data(principal)
         counts = {k: len(data[k]) for k in ("models", "datasets", "evaluations", "reports", "deployments", "school_jobs")}
         try:
-            counts["models"] = len(registry.list_models())
+            counts["models"] = len(registry.list_models(principal))
         except HTTPException:
             pass
         return {"counts": counts,
@@ -226,60 +332,58 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
                                  for m in data["models"] if m.get("scores")],
                 "demo": demo}
 
-    @app.get("/api/models", dependencies=[Depends(authorized)])
-    def models():
-        return [registry.public(model) for model in registry.list_models()]
+    @app.get("/api/models")
+    def models(principal: dict = Depends(authorized)):
+        return [registry.public(model, principal) for model in registry.list_models(principal)]
 
-    @app.post("/api/models", status_code=201, dependencies=[Depends(authorized)])
-    def create_model(body: ModelInput):
-        return registry.save(body)
+    @app.post("/api/models", status_code=201)
+    def create_model(body: ModelInput, principal: dict = Depends(authorized)):
+        return registry.save(body, actor=principal)
 
-    @app.put("/api/models/{model_id:path}", dependencies=[Depends(authorized)])
-    def update_model(model_id: str, body: ModelInput):
-        return registry.save(body, model_id)
+    @app.put("/api/models/{model_id:path}")
+    def update_model(model_id: str, body: ModelInput, principal: dict = Depends(authorized)):
+        return registry.save(body, model_id, actor=principal)
 
-    @app.delete("/api/models/{model_id:path}", dependencies=[Depends(authorized)])
-    def delete_model(model_id: str):
-        def op(data):
-            find(data["models"], model_id)
-            if any(x["model_id"] == model_id for x in data["evaluations"] + data["deployments"] + data["school_jobs"]):
-                raise HTTPException(409, "模型已被任务或申请引用")
-            data["models"] = [m for m in data["models"] if m["id"] != model_id]
-            return {"deleted": model_id}
-        return store.update(op)
+    @app.delete("/api/models/{model_id:path}")
+    def delete_model(model_id: str, principal: dict = Depends(authorized)):
+        return registry.delete(model_id, principal)
 
-    @app.get("/api/leaderboard", dependencies=[Depends(authorized)])
-    def leaderboard(board: Literal["Ruler1", "Ruler2", "VLM", "Arena"] = "Ruler1"):
+    @app.get("/api/leaderboard")
+    def leaderboard(board: Literal["Ruler1", "Ruler2", "VLM", "Arena"] = "Ruler1",
+                    principal: dict = Depends(authorized)):
         weights = {"Ruler1": [0.3, 0.3, 0.25, 0.05, 0.1], "Ruler2": [0.2, 0.15, 0.15, 0.1, 0.4],
                    "VLM": [0.1, 0.1, 0.1, 0.6, 0.1], "Arena": [0.25, 0.25, 0.25, 0.15, 0.1]}[board]
         rows = [{"id": m["id"], "name": m["name"], "provider": m["provider"],
                  "score": round(sum(a * b for a, b in zip(m["scores"], weights)), 1), "scores": m["scores"]}
-                for m in store.snapshot()["models"] if len(m.get("scores", [])) == 5]
+                for m in scoped_data(principal)["models"] if len(m.get("scores", [])) == 5]
         rows.sort(key=lambda m: m["score"], reverse=True)
         return {"board": board, "rows": [{**m, "rank": i + 1} for i, m in enumerate(rows)], "simulated": True}
 
-    @app.get("/api/recommendations", dependencies=[Depends(authorized)])
-    def recommendations(scenario: Literal["language", "code", "reasoning", "vision", "telecom"] = "language"):
+    @app.get("/api/recommendations")
+    def recommendations(scenario: Literal["language", "code", "reasoning", "vision", "telecom"] = "language",
+                        principal: dict = Depends(authorized)):
         index = {"language": 0, "code": 2, "reasoning": 1, "vision": 3, "telecom": 4}[scenario]
-        models = [m for m in store.snapshot()["models"] if len(m.get("scores", [])) == 5]
-        return {"scenario": scenario, "rows": sorted(models, key=lambda m: m["scores"][index], reverse=True)[:3], "simulated": True}
+        models = [m for m in scoped_data(principal)["models"] if len(m.get("scores", [])) == 5]
+        ranked = sorted(models, key=lambda m: m["scores"][index], reverse=True)[:3]
+        return {"scenario": scenario, "rows": [registry.public(model, principal) for model in ranked],
+                "simulated": True}
 
-    @app.get("/api/deployments", dependencies=[Depends(authorized)])
-    def deployments():
-        return store.snapshot()["deployments"]
+    @app.get("/api/deployments")
+    def deployments(principal: dict = Depends(authorized)):
+        return scoped_data(principal)["deployments"]
 
-    @app.post("/api/deployments", status_code=201, dependencies=[Depends(authorized)])
-    def create_deployment(body: DeploymentInput):
-        model = registry.get_model(body.model_id)
+    @app.post("/api/deployments", status_code=201)
+    def create_deployment(body: DeploymentInput, principal: dict = Depends(authorized)):
+        model = registry.get_model(body.model_id, principal)
         def op(data):
             item = {"id": uid("deployment"), **body.model_dump(), "model_name": model["name"], "status": "pending",
-                    "created_at": now(), "simulated": True}
+                    "created_at": now(), "simulated": True, **ownership(principal, body.visibility)}
             data["deployments"].insert(0, item)
             return item
         return store.update(op)
 
-    @app.patch("/api/deployments/{identifier}", dependencies=[Depends(authorized)])
-    def decide_deployment(identifier: str, body: Decision):
+    @app.patch("/api/deployments/{identifier}")
+    def decide_deployment(identifier: str, body: Decision, principal: dict = Depends(admin_authorized)):
         def op(data):
             item = find(data["deployments"], identifier)
             if item["status"] != "pending":
@@ -289,22 +393,23 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
             return item
         return store.update(op)
 
-    @app.get("/api/datasets", dependencies=[Depends(authorized)])
-    def datasets():
-        return store.snapshot()["datasets"]
+    @app.get("/api/datasets")
+    def datasets(principal: dict = Depends(authorized)):
+        return visible(store.snapshot()["datasets"], principal)
 
-    @app.post("/api/datasets", status_code=201, dependencies=[Depends(authorized)])
-    def create_dataset(body: DatasetInput):
+    @app.post("/api/datasets", status_code=201)
+    def create_dataset(body: DatasetInput, principal: dict = Depends(authorized)):
         def op(data):
-            item = {"id": uid("ds"), **body.model_dump(), "size": 0, "files": []}
+            item = {"id": uid("ds"), **body.model_dump(), "size": 0, "files": [],
+                    **ownership(principal, body.visibility)}
             data["datasets"].insert(0, item)
             return item
         return store.update(op)
 
-    @app.delete("/api/datasets/{dataset_id}", dependencies=[Depends(authorized)])
-    def delete_dataset(dataset_id: str):
+    @app.delete("/api/datasets/{dataset_id}")
+    def delete_dataset(dataset_id: str, principal: dict = Depends(authorized)):
         def op(data):
-            item = find(data["datasets"], dataset_id)
+            item = require_edit(find(data["datasets"], dataset_id), principal)
             if any(t["dataset_id"] == dataset_id for t in data["evaluations"]):
                 raise HTTPException(409, "数据集已被评测任务引用")
             data["datasets"].remove(item)
@@ -314,9 +419,10 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
             (store.uploads / entry["storage_name"]).unlink(missing_ok=True)
         return {"deleted": dataset_id}
 
-    @app.post("/api/datasets/{dataset_id}/files", status_code=201, dependencies=[Depends(authorized)])
-    async def upload_dataset_file(dataset_id: str, file: UploadFile = File(...)):
-        find(store.snapshot()["datasets"], dataset_id)
+    @app.post("/api/datasets/{dataset_id}/files", status_code=201)
+    async def upload_dataset_file(dataset_id: str, file: UploadFile = File(...),
+                                  principal: dict = Depends(authorized)):
+        require_edit(find(store.snapshot()["datasets"], dataset_id), principal)
         original = (file.filename or "upload.bin").replace("\\", "/").split("/")[-1][:160]
         if not original or original in (".", ".."):
             raise HTTPException(400, "文件名无效")
@@ -332,16 +438,21 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
                         raise HTTPException(413, "演示环境单文件上限为 25 MiB")
                     output.write(chunk)
             entry = {"id": file_id, "name": original, "storage_name": storage_name, "bytes": length, "uploaded_at": now()}
-            return store.update(lambda d: find(d["datasets"], dataset_id)["files"].append(entry) or entry)
+            def add_file(data):
+                dataset = require_edit(find(data["datasets"], dataset_id), principal)
+                dataset["files"].append(entry)
+                return entry
+            return store.update(add_file)
         except Exception:
             target.unlink(missing_ok=True)
             raise
         finally:
             await file.close()
 
-    @app.get("/api/datasets/{dataset_id}/files/{file_id}", dependencies=[Depends(authorized)])
-    def download_dataset_file(dataset_id: str, file_id: str):
-        entry = find(find(store.snapshot()["datasets"], dataset_id)["files"], file_id)
+    @app.get("/api/datasets/{dataset_id}/files/{file_id}")
+    def download_dataset_file(dataset_id: str, file_id: str, principal: dict = Depends(authorized)):
+        dataset = require_view(find(store.snapshot()["datasets"], dataset_id), principal)
+        entry = find(dataset["files"], file_id)
         target = store.uploads / entry["storage_name"]
         if not target.is_file():
             raise HTTPException(404, "文件不存在")
@@ -351,9 +462,9 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
         store.update(count_download)
         return FileResponse(target, filename=entry["name"], media_type="application/octet-stream")
 
-    @app.get("/api/data-governance", dependencies=[Depends(authorized)])
-    def data_governance():
-        data = store.snapshot()
+    @app.get("/api/data-governance")
+    def data_governance(principal: dict = Depends(authorized)):
+        data = scoped_data(principal)
         categories = {}
         for dataset in data["datasets"]:
             categories[dataset["category"]] = categories.get(dataset["category"], 0) + 1
@@ -361,62 +472,65 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
                 "downloads": sum(f.get("downloads", 0) for x in data["datasets"] for f in x["files"]),
                 "annotations": len(data["annotations"]), "vla": {"status": "待接入", "scenes": None, "applications": None, "simulated": True}}
 
-    @app.get("/api/annotations", dependencies=[Depends(authorized)])
-    def annotations(dataset_id: str | None = None):
-        rows = store.snapshot()["annotations"]
+    @app.get("/api/annotations")
+    def annotations(dataset_id: str | None = None, principal: dict = Depends(authorized)):
+        rows = scoped_data(principal)["annotations"]
         return [row for row in rows if dataset_id is None or row["dataset_id"] == dataset_id]
 
-    @app.post("/api/annotations", status_code=201, dependencies=[Depends(authorized)])
-    def create_annotation(body: AnnotationInput):
+    @app.post("/api/annotations", status_code=201)
+    def create_annotation(body: AnnotationInput, principal: dict = Depends(authorized)):
         def op(data):
-            dataset = find(data["datasets"], body.dataset_id)
-            item = {"id": uid("annotation"), **body.model_dump(), "dataset_name": dataset["name"], "created_at": now()}
+            dataset = require_view(find(data["datasets"], body.dataset_id), principal)
+            item = {"id": uid("annotation"), **body.model_dump(), "dataset_name": dataset["name"],
+                    "created_at": now(), **ownership(principal, body.visibility)}
             data["annotations"].insert(0, item)
             return item
         return store.update(op)
 
-    @app.get("/api/evaluations", dependencies=[Depends(authorized)])
-    def evaluations():
-        return store.snapshot()["evaluations"]
+    @app.get("/api/evaluations")
+    def evaluations(principal: dict = Depends(authorized)):
+        return scoped_data(principal)["evaluations"]
 
-    @app.post("/api/evaluations", status_code=201, dependencies=[Depends(authorized)])
-    def create_evaluation(body: EvalInput):
-        model = registry.get_model(body.model_id)
+    @app.post("/api/evaluations", status_code=201)
+    def create_evaluation(body: EvalInput, principal: dict = Depends(authorized)):
+        model = registry.get_model(body.model_id, principal)
         def op(data):
-            dataset = find(data["datasets"], body.dataset_id)
+            dataset = require_view(find(data["datasets"], body.dataset_id), principal)
             item = {"id": uid("eval"), **body.model_dump(), "model_name": model["name"], "dataset_name": dataset["name"],
                     "status": "queued", "progress": 0, "created_at": now(), "updated_at": now(), "logs": [f"{now()} 任务已提交"],
-                    "report_id": None, "simulated": True}
+                    "report_id": None, "simulated": True, **ownership(principal, body.visibility)}
             data["evaluations"].insert(0, item)
             return item
         return store.update(op)
 
-    @app.post("/api/evaluations/batch", status_code=201, dependencies=[Depends(authorized)])
-    def create_batch_evaluations(body: BatchEvalInput):
+    @app.post("/api/evaluations/batch", status_code=201)
+    def create_batch_evaluations(body: BatchEvalInput, principal: dict = Depends(authorized)):
         if len(set(body.model_ids)) != len(body.model_ids):
             raise HTTPException(422, "模型不能重复")
-        models = [registry.get_model(identifier) for identifier in body.model_ids]
+        models = [registry.get_model(identifier, principal) for identifier in body.model_ids]
         def op(data):
-            dataset = find(data["datasets"], body.dataset_id)
+            dataset = require_view(find(data["datasets"], body.dataset_id), principal)
             created = []
             for model in models:
                 task = {"id": uid("eval"), "model_id": model["id"], "dataset_id": dataset["id"],
                         "benchmark": body.benchmark, "model_name": model["name"], "dataset_name": dataset["name"],
                         "status": "queued", "progress": 0, "created_at": now(), "updated_at": now(),
-                        "logs": [f"{now()} 并行评测任务已提交"], "report_id": None, "simulated": True}
+                        "logs": [f"{now()} 并行评测任务已提交"], "report_id": None, "simulated": True,
+                        **ownership(principal, body.visibility)}
                 data["evaluations"].insert(0, task)
                 created.append(task)
             return created
         return store.update(op)
 
-    @app.get("/api/evaluations/{identifier}", dependencies=[Depends(authorized)])
-    def evaluation(identifier: str):
-        return find(store.snapshot()["evaluations"], identifier)
+    @app.get("/api/evaluations/{identifier}")
+    def evaluation(identifier: str, principal: dict = Depends(authorized)):
+        return find(scoped_data(principal)["evaluations"], identifier)
 
-    @app.patch("/api/evaluations/{identifier}", dependencies=[Depends(authorized)])
-    def action_evaluation(identifier: str, body: TaskAction):
+    @app.patch("/api/evaluations/{identifier}")
+    def action_evaluation(identifier: str, body: TaskAction, principal: dict = Depends(authorized)):
+        find(scoped_data(principal)["evaluations"], identifier)
         def op(data):
-            task = find(data["evaluations"], identifier)
+            task = require_edit(find(data["evaluations"], identifier), principal)
             allowed = {"pause": ("queued", "running"), "resume": ("paused",), "cancel": ("queued", "running", "paused")}
             if task["status"] not in allowed[body.action]:
                 raise HTTPException(409, "当前状态不能执行该操作")
@@ -426,13 +540,16 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
             return task
         return store.update(op)
 
-    @app.get("/api/evaluations/{identifier}/events", dependencies=[Depends(authorized)])
-    async def evaluation_events(identifier: str, request: Request):
-        find(store.snapshot()["evaluations"], identifier)
+    @app.get("/api/evaluations/{identifier}/events")
+    async def evaluation_events(identifier: str, request: Request, principal: dict = Depends(authorized)):
+        find(scoped_data(principal)["evaluations"], identifier)
         async def stream():
             previous = ""
             while not await request.is_disconnected():
-                state = find(store.snapshot()["evaluations"], identifier)
+                try:
+                    state = find(scoped_data(principal)["evaluations"], identifier)
+                except HTTPException:
+                    break
                 serialized = json.dumps(state, ensure_ascii=False)
                 if serialized != previous:
                     yield f"event: state\ndata: {serialized}\n\n"
@@ -442,12 +559,12 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
                 await asyncio.sleep(0.7)
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    @app.get("/api/reports", dependencies=[Depends(authorized)])
-    def reports():
-        return store.snapshot()["reports"]
+    @app.get("/api/reports")
+    def reports(principal: dict = Depends(authorized)):
+        return scoped_data(principal)["reports"]
 
-    @app.patch("/api/reports/{identifier}/publish", dependencies=[Depends(authorized)])
-    def publish_report(identifier: str):
+    @app.patch("/api/reports/{identifier}/publish")
+    def publish_report(identifier: str, principal: dict = Depends(admin_authorized)):
         def op(data):
             report = find(data["reports"], identifier)
             report["published"] = not report["published"]
@@ -476,9 +593,9 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
         }
         return {"kind": kind, "input": body.content[:200], "output": outputs[kind], "simulated": True}
 
-    @app.post("/api/agents/chat/stream", dependencies=[Depends(authorized)])
-    async def chat(body: ChatInput):
-        model = await asyncio.to_thread(registry.get_model, body.model_id)
+    @app.post("/api/agents/chat/stream")
+    async def chat(body: ChatInput, principal: dict = Depends(authorized)):
+        model = await asyncio.to_thread(registry.get_model, body.model_id, principal)
         endpoint = registry.next_endpoint(model)
         api_key = registry.api_key(endpoint)
         endpoint_url = endpoint["url"]
@@ -563,22 +680,23 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
             yield event("done", {})
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    @app.get("/api/school/jobs", dependencies=[Depends(authorized)])
-    def school_jobs():
-        return store.snapshot()["school_jobs"]
+    @app.get("/api/school/jobs")
+    def school_jobs(principal: dict = Depends(authorized)):
+        return visible(store.snapshot()["school_jobs"], principal)
 
-    @app.post("/api/school/jobs", status_code=201, dependencies=[Depends(authorized)])
-    def create_school_job(body: SchoolJobInput):
+    @app.post("/api/school/jobs", status_code=201)
+    def create_school_job(body: SchoolJobInput, principal: dict = Depends(authorized)):
         def op(data):
             item = {"id": uid("school"), **body.model_dump(), "status": "queued", "progress": 0,
-                    "created_at": now(), "updated_at": now(), "logs": [f"{now()} 已提交脚本；演示模式不会执行代码"], "simulated": True}
+                    "created_at": now(), "updated_at": now(), "logs": [f"{now()} 已提交脚本；演示模式不会执行代码"],
+                    "simulated": True, **ownership(principal, body.visibility)}
             data["school_jobs"].insert(0, item)
             return item
         return store.update(op)
 
-    @app.post("/api/school/infer", dependencies=[Depends(authorized)])
-    def infer(body: InferenceInput):
-        model = registry.get_model(body.model_id)
+    @app.post("/api/school/infer")
+    def infer(body: InferenceInput, principal: dict = Depends(authorized)):
+        model = registry.get_model(body.model_id, principal)
         return {"model": model["name"], "zone": body.zone, "output": f"[模拟推理] {model['name']} 收到输入：{body.prompt[:200]}",
                 "tokens": len(body.prompt), "simulated": True}
 
@@ -598,7 +716,7 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
         await websocket.accept()
         try:
             first = await asyncio.wait_for(websocket.receive_json(), timeout=5)
-            decode_token(first.get("token", ""))
+            auth.current(first.get("token", ""))
             while True:
                 await websocket.send_json(metrics())
                 await asyncio.sleep(2)

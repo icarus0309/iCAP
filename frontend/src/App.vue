@@ -1,7 +1,8 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuth } from './stores/auth'
+import { ElMessage } from 'element-plus'
 
 const route = useRoute()
 const router = useRouter()
@@ -14,12 +15,25 @@ const groups = [
   { name: '智能应用', links: [['/agents', 'Agent 工作台', '✧'], ['/school', 'AI School', '◈']] },
   { name: '管理', links: [['/operations', '运营与监控', '▦']] },
 ]
-const isLogin = computed(() => route.path === '/login')
-function signOut() { auth.logout(); router.push('/login') }
+const isAuthPage = computed(() => route.meta.public === true)
+const signingOut = ref(false)
+onMounted(async () => {
+  if (auth.token && !await auth.refreshProfile()) await router.replace('/login')
+})
+async function signOut() {
+  if (signingOut.value) return
+  signingOut.value = true
+  try {
+    const revoked = await auth.logout()
+    await router.replace('/login')
+    if (!revoked) ElMessage.warning('本机已退出，但服务器未确认注销，请稍后检查连接')
+  } finally { signingOut.value = false }
+}
+function openAccountPage(path) { router.push(path) }
 </script>
 
 <template>
-  <router-view v-if="isLogin" />
+  <router-view v-if="isAuthPage" />
   <div v-else class="shell">
     <div v-if="mobileNav" class="nav-shade" @click="mobileNav = false" />
     <aside class="sidebar" :class="{ open: mobileNav }">
@@ -40,7 +54,7 @@ function signOut() { auth.logout(); router.push('/login') }
     <div class="workspace">
       <header class="topbar">
         <div class="top-left"><button class="menu-button" @click="mobileNav = true">☰</button><span class="crumb">{{ route.meta.group || '工作台' }} <b>/</b> <strong>{{ route.meta.title }}</strong></span></div>
-        <div class="top-right"><span class="avatar">{{ auth.username?.slice(0, 1).toUpperCase() || 'A' }}</span><span class="user-name">{{ auth.username || 'admin' }}</span><el-button text @click="signOut">退出</el-button></div>
+        <div class="top-right"><span class="avatar">{{ auth.username?.slice(0, 1).toUpperCase() || 'A' }}</span><span class="user-name">{{ auth.username || 'admin' }}</span><el-dropdown v-if="auth.role !== 'admin'" @command="openAccountPage"><span class="account-menu">账户设置 ▾</span><template #dropdown><el-dropdown-menu><el-dropdown-item v-if="!auth.securityQuestionsConfigured" command="/security-questions/setup">设置密保</el-dropdown-item><el-dropdown-item command="/password/change">修改密码</el-dropdown-item></el-dropdown-menu></template></el-dropdown><el-button text :loading="signingOut" @click="signOut">退出</el-button></div>
       </header>
       <main class="page"><router-view /></main>
     </div>

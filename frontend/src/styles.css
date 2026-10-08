@@ -29,7 +29,9 @@ a { color: inherit; text-decoration: none; }
 .crumb strong { color: #303c50; font-weight: 650; }
 .demo-pill { color: #aa6d20; background: #fff7e7; border: 1px solid #fbe9c5; font-size: 11px; padding: 6px 10px; border-radius: 30px; font-weight: 650; margin-right: 12px; }
 .avatar { display: grid; place-items: center; width: 31px; height: 31px; border-radius: 50%; background: #2f3c50; color: white; font-weight: 700; font-size: 12px; }
-.user-name { font-size: 12px; font-weight: 600; }
+.user-name { font-size: 12px; font-weight: 600; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-menu { color: #657084; font-size: 12px; font-weight: 650; cursor: pointer; white-space: nowrap; }
+.account-menu:hover { color: var(--red); }
 .menu-button { border: 0; background: transparent; font-size: 20px; display: none; }
 .page { max-width: 1560px; margin: 0 auto; padding: 31px 37px 52px; }
 .page-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 26px; }
