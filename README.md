@@ -45,7 +45,7 @@ npm run dev
 | 业务域 | 已实现 | 当前模拟或适配点 |
 | --- | --- | --- |
 | MaaS | DeepSeek 实时模型目录、模型注册与多 API 端点管理、部署申请/审批 | 榜单与推荐仍依赖本地评分记录；实际模型部署审批不调用集群 |
-| 数据与评测 | 数据集登记、文件上传下载、人工标注记录、治理统计、单模型/多模型评测创建、暂停/恢复/取消、SSE 进度日志、报告预览与发布状态 | 评分任务使用定时模拟执行器，未调用 Ruler1/2/VLM 真正评测脚本；VLA 统计待接入 |
+| 数据与评测 | 数据集登记、文件上传下载、人工标注记录、治理统计、单模型/多模型评测创建、暂停/恢复/取消、SSE 进度日志、报告预览与发布状态；**尺子一/尺子二真实测评引擎**（内置样例库、按维度加权判分、综合分/维度分/用例级明细、可选榜单回写） | 评分引擎为本地实现，未调用 Ruler1/2/VLM 官方评测脚本；VLM/AISF/Dev/ASR/MT/TTS 仍走模拟执行器；VLA 统计待接入 |
 | Agent | 注册模型的真实 SSE 对话、双模型对战、论文搜索与工具工作台 | 论文目录及辅助工具仍是示例结果 |
 | AI School | 架构浏览、训练任务提交、日志/进度、推理沙箱、监控 WebSocket | 训练脚本只保存文本且**不执行**；推理和设备指标为演示数据 |
 
@@ -67,5 +67,37 @@ python -m pytest -q
 cd ../frontend
 npm run build
 ```
+
+后端测试共 29 个：`tests/test_api.py`（既有 5 个接口回归）+ `tests/test_evaluation.py`（测评引擎 24 个：规格校验、样例唯一性、五类判分、demo 确定性、汇总口径、统一与逐维度取样、逐维度配置校验与 batch 忽略、状态机暂停/取消/重启续跑/关闭不阻塞、rulers 与 result 接口契约、batch 默认参数、非尺子 benchmark 仍走模拟、live 答题契约与坏端点失败路径）。
+
+测试通过 `monkeypatch` 把 `DEMO_MODE`、`INNOVATION_ADMIN_USER`、`INNOVATION_ADMIN_PASSWORD` 固定在 demo 口径。仓库根 `.env` 会被 `load_dotenv` 载入，而 `os.getenv` 的优先级高于 `create_app(demo=True)` 的内置默认值，因此不固定这几项时，生产口径的 `.env` 会让用例无法用 `demo1234` 登录。
+
+若 `npm run build` 报 `[vite:esbuild-transpile] remove ...esbuild-<hash>: Access is denied`，是 esbuild 清理 `os.tmpdir()`（默认 `C:\Users\<用户>\AppData\Local\Temp`）下的临时目录被拒所致；把临时目录指到工程内可绕开（该次构建会先清空 `dist`，务必重跑成功后再启动后端）：
+
+```powershell
+cd frontend
+$env:TMP = "$PWD\.build-tmp"; $env:TEMP = $env:TMP
+New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+npm run build
+```
+
+若 `python` 不在 PATH（本机即为该情况），可直接使用虚拟环境解释器：
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+## 模型测评引擎（尺子一 / 尺子二）
+
+- 规格：`backend/app/evaluation/specs.py`。尺子一（通用能力：知识/推理/数学/代码/指令遵循，权重 0.30/0.30/0.25/0.05/0.10）、尺子二（通信领域：意图分类/功能调用/记忆保持/澄清对话/感知规划，权重 0.20/0.15/0.15/0.10/0.40）；维度权重之和为 1。
+- 样例：`backend/app/evaluation/cases.py`，两把尺子各 25 条（5 维度 × 5 条）。取样口径支持两种：`config.sample_limit` 统一每维度前 N 条；`config.sample_limits`（形如 `{"knowledge": 2, "math": 5}`）逐维度指定，未列出的维度回落 `sample_limit`。两者同时给出时以 `sample_limits` 为准，非法维度 key 或越界条数在创建接口即返回 422。
+- 判分：`engine.py` 为纯函数静态判分（math 数值比对、code 语法关键词、format 长度、choice/open 关键词包含度），**不执行**模型生成的代码。
+- 执行：`worker.py` 的 `EvaluationRunner` 单 worker 串行推进；报告生成、`report_id` 写入与榜单回写都在同一事务内完成；暂停在用例边界生效，取消不生成报告，进程重启后 running 任务自动重排。
+- 答题：`DEMO_MODE=true` 用 `demo_answer`（以用例 id 的 sha256 确定作答，结果可复现、离线可演示）；`DEMO_MODE=false` 用 `live_answer` 调模型端点（`/chat/completions`，temperature 0、stream 关闭，网络类异常重试 2 次）。
+- 接口：`GET /api/rulers`（尺子规格与可用样例数）、`GET /api/evaluations/{id}/result`（结果三态）；`POST /api/evaluations` 接受 `config`，`POST /api/evaluations/batch` 不接受 `config`（一律用尺子默认值）。
+- 榜单联动：仅尺子一且 `config.sync_scores=true` 时回写 `models[].scores`，与 `/api/leaderboard` 的 Ruler1 权重口径一致；尺子二不写通用榜单。
+- 前端：`views/Evaluations.vue`（列表 + 发起）、`views/EvaluationDetail.vue`（进度/日志/SSE 重连/三态结果）、`components/evaluation/`（RulerPicker、CreateEvaluationDialog、EvalResultPanel、CaseResultTable）。发起弹窗的「高级参数 → 自定义参数」为每个维度提供独立取样条数输入框，实时显示用例总数。
+- 未接入：VLM/AISF/Dev/ASR/MT/TTS 仍由模拟执行器推进，结果标注 `simulated=true`。
 
 API 契约见 FastAPI `/docs`。源码入口分别为 `backend/app/main.py` 与 `frontend/src/main.js`。

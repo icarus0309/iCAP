@@ -16,6 +16,11 @@ def endpoint(url="http://127.0.0.1:9001/v1", api_key="local-secret"):
 
 def client_with_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    # 固定在 demo 口径：仓库根 .env 的 DEMO_MODE / ADMIN_PASSWORD 会通过 os.getenv
+    # 覆盖 create_app 的 demo 默认值，导致登录口令与默认 admin 变化
+    monkeypatch.setenv("DEMO_MODE", "true")
+    monkeypatch.setenv("INNOVATION_ADMIN_USER", "admin")
+    monkeypatch.setenv("INNOVATION_ADMIN_PASSWORD", "demo1234")
     client = TestClient(create_app(tmp_path, demo=True))
     response = client.post("/api/auth/login", json={"username": "admin", "password": "demo1234"})
     assert response.status_code == 200
@@ -162,6 +167,9 @@ def test_model_endpoints_round_robin_and_real_stream_contract(tmp_path, monkeypa
 
 def test_deepseek_model_edit_keeps_key_server_side(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-secret")
+    monkeypatch.setenv("DEMO_MODE", "true")
+    monkeypatch.setenv("INNOVATION_ADMIN_USER", "admin")
+    monkeypatch.setenv("INNOVATION_ADMIN_PASSWORD", "demo1234")
 
     class CatalogResponse:
         def raise_for_status(self):

@@ -23,8 +23,10 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
+from .evaluation import (RULER_IDS, RULER_SPECS, EvaluationRunner, flatten_cases,
+                         get_cases_for_ruler, get_ruler_spec)
 from .model_registry import ModelInput, ModelRegistry
 from .store import Store
 
@@ -58,13 +60,48 @@ class DatasetInput(BaseModel):
     description: str = Field(default="", max_length=500)
 
 
+class EvalConfig(BaseModel):
+    """测评参数。batch 接口不接收该结构，一律使用尺子默认值。
+
+    `sample_limit` 为统一取样口径（兼容旧前端）；`sample_limits` 为逐维度取样口径，
+    形如 {"knowledge": 2, "math": 5}，未列出的维度回落到 `sample_limit`。
+    两者同时给出时以 `sample_limits` 为准。
+    """
+    sample_limit: int = Field(default=5, ge=1, le=10)
+    sample_limits: dict[str, StrictInt] | None = None
+    max_tokens: int = Field(default=1024, ge=16, le=8192)
+    temperature: float = Field(default=0.0, ge=0, le=2)
+    sync_scores: bool = False
+
+
+def resolve_sample_limits(spec, config: dict | None) -> dict[str, int] | None:
+    """把任务 config 归一化为逐维度取样表；无逐维度配置时返回 None（统一口径）。
+
+    校验维度 key 必须属于该尺子、条数在 1~10，非法配置抛 422。
+    """
+    raw = (config or {}).get("sample_limits")
+    if not raw:
+        return None
+    known = {d["key"] for d in spec.dimensions}
+    limits: dict[str, int] = {}
+    for key, value in raw.items():
+        if key not in known:
+            raise HTTPException(422, f"维度 {key} 不属于 {spec.label}")
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 10:
+            raise HTTPException(422, f"维度 {key} 的取样条数必须在 1~10 之间")
+        limits[key] = value
+    return limits
+
+
 class EvalInput(BaseModel):
     model_id: str
     dataset_id: str
     benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Dev", "ASR", "MT", "TTS"] = "Ruler1"
+    config: EvalConfig | None = None
 
 
 class BatchEvalInput(BaseModel):
+    """批量评测请求：不支持 config，子任务使用对应尺子的默认参数。"""
     model_ids: list[str] = Field(min_length=1, max_length=4)
     dataset_id: str
     benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Dev", "ASR", "MT", "TTS"] = "Ruler1"
@@ -116,43 +153,87 @@ class ToolInput(BaseModel):
     content: str = Field(min_length=1, max_length=10000)
 
 
-async def advance_jobs(store: Store, stop: asyncio.Event) -> None:
-    """A visible demo executor. No user-submitted code is ever executed."""
+def simulate_school_jobs(store: Store) -> None:
+    """学校训练任务的模拟执行器。不执行任何用户提交的代码。"""
+    def tick(data: dict) -> None:
+        for task in data["school_jobs"]:
+            if task["status"] not in ("queued", "running"):
+                continue
+            if task["status"] == "queued":
+                task["status"] = "running"
+                task["logs"].append(f"{now()} 开始模拟执行")
+            task["progress"] = min(100, task["progress"] + 10)
+            task["updated_at"] = now()
+            if task["progress"] % 20 == 0:
+                task["logs"].append(f"{now()} 模拟任务进度 {task['progress']}%")
+            if task["progress"] == 100:
+                task["status"] = "completed"
+                task["logs"].append(f"{now()} 模拟任务完成")
+    store.update(tick)
+
+
+def simulate_legacy_evaluations(store: Store) -> None:
+    """未接入测评引擎的 benchmark（VLM/AISF/Dev/ASR/MT/TTS）沿用原模拟执行器。
+
+    Ruler1/Ruler2 任务由 EvaluationRunner 真实推进，不在本函数处理范围内。
+    """
+    def tick(data: dict) -> None:
+        for task in data["evaluations"]:
+            if task["benchmark"] in RULER_IDS or task.get("ruler_label"):
+                continue
+            if task["status"] not in ("queued", "running"):
+                continue
+            if task["status"] == "queued":
+                task["status"] = "running"
+                task["logs"].append(f"{now()} 开始模拟执行")
+            task["progress"] = min(100, task["progress"] + 10)
+            task["updated_at"] = now()
+            if task["progress"] % 20 == 0:
+                task["logs"].append(f"{now()} 模拟任务进度 {task['progress']}%")
+            if task["progress"] == 100:
+                task["status"] = "completed"
+                task["logs"].append(f"{now()} 模拟任务完成")
+                model = next((m for m in data["models"] if m["id"] == task["model_id"]), None)
+                scores = model.get("scores", []) if model else []
+                score = round(sum(scores) / len(scores), 1) if scores else 0
+                report = dict(id=uid("report"), evaluation_id=task["id"], title=f"{task['benchmark']} · {task['model_name']}",
+                              score=score, created_at=now(), published=False, simulated=True,
+                              summary=f"演示评测报告：{task['model_name']} 在 {task['dataset_name']} 上得到示例分数 {score}。"
+                                      "未调用真实测评脚本，不能作为模型能力结论。")
+                data["reports"].insert(0, report)
+                task["report_id"] = report["id"]
+    store.update(tick)
+
+
+async def advance_jobs(store: Store, stop: asyncio.Event, runner: EvaluationRunner, worker_tick: float) -> None:
+    """调度循环：学校任务与旧 benchmark 走模拟，Ruler1/Ruler2 走真实测评引擎。"""
+    step_timeout = max(worker_tick * 40, 30.0)  # 最后防线：极端卡死时取消本轮 step
+    idle = False
     while not stop.is_set():
-        def tick(data: dict) -> None:
-            for group in ("evaluations", "school_jobs"):
-                for task in data[group]:
-                    if task["status"] not in ("queued", "running"):
-                        continue
-                    if task["status"] == "queued":
-                        task["status"] = "running"
-                        task["logs"].append(f"{now()} 开始模拟执行")
-                    task["progress"] = min(100, task["progress"] + 10)
-                    task["updated_at"] = now()
-                    if task["progress"] % 20 == 0:
-                        task["logs"].append(f"{now()} 模拟任务进度 {task['progress']}%")
-                    if task["progress"] == 100:
-                        task["status"] = "completed"
-                        task["logs"].append(f"{now()} 模拟任务完成")
-                        if group == "evaluations":
-                            model = next((m for m in data["models"] if m["id"] == task["model_id"]), None)
-                            scores = model.get("scores", []) if model else []
-                            score = round(sum(scores) / len(scores), 1) if scores else 0
-                            report = dict(id=uid("report"), evaluation_id=task["id"], title=f"{task['benchmark']} · {task['model_name']}",
-                                          score=score, created_at=now(), published=False, simulated=True,
-                                          summary=f"演示评测报告：{task['model_name']} 在 {task['dataset_name']} 上得到示例分数 {score}。"
-                                                  "未调用真实测评脚本，不能作为模型能力结论。")
-                            data["reports"].insert(0, report)
-                            task["report_id"] = report["id"]
-        store.update(tick)
+        simulate_school_jobs(store)
+        simulate_legacy_evaluations(store)
         try:
-            await asyncio.wait_for(stop.wait(), timeout=1.3)
+            await asyncio.wait_for(runner.step(), timeout=step_timeout)
+            idle = False
+        except asyncio.TimeoutError:
+            idle = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                                   # 引擎异常不允许拖垮调度循环
+            print(f"[evaluation] 调度异常：{exc}", flush=True)
+        if runner.active_task_id is None and not idle:
+            idle = True
+            runner.shutdown()
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=worker_tick)
         except asyncio.TimeoutError:
             pass
 
 
-def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> FastAPI:
+def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
+               worker_tick: float | None = None) -> FastAPI:
     demo = (os.getenv("DEMO_MODE", "true").lower() == "true") if demo is None else demo
+    worker_tick = (0.05 if demo else 1.3) if worker_tick is None else worker_tick
     admin_user = os.getenv("INNOVATION_ADMIN_USER", "admin" if demo else "")
     admin_password = os.getenv("INNOVATION_ADMIN_PASSWORD", "demo1234" if demo else "")
     secret = os.getenv("INNOVATION_SECRET_KEY", "demo-only-secret-please-change-in-production" if demo else "")
@@ -162,13 +243,15 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
     store = Store(base)
     registry = ModelRegistry(store)
     stop = asyncio.Event()
+    runner = EvaluationRunner(store, registry, live=(not demo), stop=stop)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        worker = asyncio.create_task(advance_jobs(store, stop))
+        worker = asyncio.create_task(advance_jobs(store, stop, runner, worker_tick))
         yield
         stop.set()
         await worker
+        runner.shutdown()
 
     app = FastAPI(title="InnovationCore AI Platform", version="0.1.0", lifespan=lifespan)
     app.state.store = store
@@ -257,6 +340,18 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
                 for m in store.snapshot()["models"] if len(m.get("scores", [])) == 5]
         rows.sort(key=lambda m: m["score"], reverse=True)
         return {"board": board, "rows": [{**m, "rank": i + 1} for i, m in enumerate(rows)], "simulated": True}
+
+    @app.get("/api/rulers", dependencies=[Depends(authorized)])
+    def rulers():
+        """返回已接入测评引擎的尺子规格（维度、权重与可用样例数）。"""
+        out = []
+        for spec in RULER_SPECS:
+            cases = flatten_cases(get_cases_for_ruler(spec.id), None)
+            out.append({"id": spec.id, "label": spec.label, "scope": spec.scope,
+                        "description": spec.description, "dimensions": spec.dimensions,
+                        "default_sample_limit": spec.default_sample_limit,
+                        "available_cases": len(cases)})
+        return {"rulers": out}
 
     @app.get("/api/recommendations", dependencies=[Depends(authorized)])
     def recommendations(scenario: Literal["language", "code", "reasoning", "vision", "telecom"] = "language"):
@@ -379,14 +474,36 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
     def evaluations():
         return store.snapshot()["evaluations"]
 
+    def _make_eval_item(data: dict, *, benchmark: str, model: dict, dataset_id: str,
+                        default_log: str, config_raw: EvalConfig | None = None) -> dict:
+        """构造评测任务条目。benchmark 为尺子时补齐 ruler_label/config/result，否则保持旧结构。"""
+        item = {"id": uid("eval"), "model_id": model["id"], "dataset_id": dataset_id,
+                "benchmark": benchmark, "model_name": model["name"],
+                "dataset_name": find(data["datasets"], dataset_id)["name"],
+                "status": "queued", "progress": 0, "created_at": now(), "updated_at": now(),
+                "logs": [f"{now()} {default_log}"], "report_id": None, "simulated": True}
+        if benchmark in RULER_IDS:
+            spec = get_ruler_spec(benchmark)
+            item["ruler_label"] = spec.label
+            item["config"] = config_raw.model_dump() if config_raw else {
+                "sample_limit": spec.default_sample_limit,          # batch 不传 config → 默认
+                "sample_limits": None,
+                "max_tokens": 1024, "temperature": 0.0, "sync_scores": False}
+            item["result"] = None
+        return item
+
     @app.post("/api/evaluations", status_code=201, dependencies=[Depends(authorized)])
     def create_evaluation(body: EvalInput):
-        model = registry.get_model(body.model_id)
+        model = registry.get_model(body.model_id)              # 404「模型不存在」
+        if body.config is not None and body.benchmark in RULER_IDS:
+            # 请求期即校验逐维度取样配置，非法维度 key/条数直接 422，不落库
+            resolve_sample_limits(get_ruler_spec(body.benchmark), body.config.model_dump())
+
         def op(data):
-            dataset = find(data["datasets"], body.dataset_id)
-            item = {"id": uid("eval"), **body.model_dump(), "model_name": model["name"], "dataset_name": dataset["name"],
-                    "status": "queued", "progress": 0, "created_at": now(), "updated_at": now(), "logs": [f"{now()} 任务已提交"],
-                    "report_id": None, "simulated": True}
+            find(data["datasets"], body.dataset_id)            # 404「数据集不存在」
+            item = _make_eval_item(data, benchmark=body.benchmark, model=model,
+                                   dataset_id=body.dataset_id, default_log="任务已提交",
+                                   config_raw=body.config)
             data["evaluations"].insert(0, item)
             return item
         return store.update(op)
@@ -396,14 +513,13 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
         if len(set(body.model_ids)) != len(body.model_ids):
             raise HTTPException(422, "模型不能重复")
         models = [registry.get_model(identifier) for identifier in body.model_ids]
+
         def op(data):
-            dataset = find(data["datasets"], body.dataset_id)
+            find(data["datasets"], body.dataset_id)            # 404「数据集不存在」
             created = []
             for model in models:
-                task = {"id": uid("eval"), "model_id": model["id"], "dataset_id": dataset["id"],
-                        "benchmark": body.benchmark, "model_name": model["name"], "dataset_name": dataset["name"],
-                        "status": "queued", "progress": 0, "created_at": now(), "updated_at": now(),
-                        "logs": [f"{now()} 并行评测任务已提交"], "report_id": None, "simulated": True}
+                task = _make_eval_item(data, benchmark=body.benchmark, model=model,
+                                       dataset_id=body.dataset_id, default_log="并行评测任务已提交")
                 data["evaluations"].insert(0, task)
                 created.append(task)
             return created
@@ -412,6 +528,13 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None) -> 
     @app.get("/api/evaluations/{identifier}", dependencies=[Depends(authorized)])
     def evaluation(identifier: str):
         return find(store.snapshot()["evaluations"], identifier)
+
+    @app.get("/api/evaluations/{identifier}/result", dependencies=[Depends(authorized)])
+    def evaluation_result(identifier: str):
+        task = find(store.snapshot()["evaluations"], identifier)
+        if task.get("result") is not None:
+            return {"state": task["status"], "result": task["result"]}
+        return {"state": task["status"], "result": None, "progress": task["progress"]}
 
     @app.patch("/api/evaluations/{identifier}", dependencies=[Depends(authorized)])
     def action_evaluation(identifier: str, body: TaskAction):

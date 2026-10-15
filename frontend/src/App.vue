@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuth } from './stores/auth'
+import { routes } from './router'
 
 const route = useRoute()
 const router = useRouter()
@@ -16,6 +17,22 @@ const groups = [
 ]
 const isLogin = computed(() => route.path === '/login')
 function signOut() { auth.logout(); router.push('/login') }
+
+// ---- 顶栏面包屑的「返回上级」 ----
+// meta.parent 指向更上一级页面的路径；未声明即无上级（仅工作台）。
+const parentPath = computed(() => route.meta.parent || '')
+const parentTitle = computed(() => {
+  if (!parentPath.value) return ''
+  const parent = routes.find((item) => item.path === parentPath.value)
+  return parent?.meta?.title || '上一级'
+})
+function goUp() { if (parentPath.value) router.push(parentPath.value) }
+
+// 详情页等子路由按前缀命中侧边导航的父级标签（'/' 不参与前缀匹配，否则会命中所有路径）。
+function isActiveLink(path) {
+  if (route.path === path) return true
+  return path !== '/' && route.path.startsWith(`${path}/`)
+}
 </script>
 
 <template>
@@ -30,8 +47,8 @@ function signOut() { auth.logout(); router.push('/login') }
       <div class="nav-scroll">
         <div v-for="group in groups" :key="group.name" class="nav-group">
           <div class="nav-heading">{{ group.name }}</div>
-          <router-link v-for="[path, title, icon] in group.links" :key="path" :to="path" class="nav-link" :class="{ active: route.path === path }" @click="mobileNav = false">
-            <span class="nav-icon">{{ icon }}</span><span>{{ title }}</span><span v-if="route.path === path" class="active-dot" />
+          <router-link v-for="[path, title, icon] in group.links" :key="path" :to="path" class="nav-link" :class="{ active: isActiveLink(path) }" @click="mobileNav = false">
+            <span class="nav-icon">{{ icon }}</span><span>{{ title }}</span><span v-if="isActiveLink(path)" class="active-dot" />
           </router-link>
         </div>
       </div>
@@ -39,7 +56,16 @@ function signOut() { auth.logout(); router.push('/login') }
     </aside>
     <div class="workspace">
       <header class="topbar">
-        <div class="top-left"><button class="menu-button" @click="mobileNav = true">☰</button><span class="crumb">{{ route.meta.group || '工作台' }} <b>/</b> <strong>{{ route.meta.title }}</strong></span></div>
+        <div class="top-left">
+          <button class="menu-button" @click="mobileNav = true">☰</button>
+          <button v-if="parentPath" class="crumb-back" type="button" :title="`返回${parentTitle}`" :aria-label="`返回${parentTitle}`" @click="goUp">←</button>
+          <span class="crumb" :class="{ 'crumb-nested': !!parentPath }">
+            <button v-if="parentPath" class="crumb-up" type="button" @click="goUp">{{ route.meta.group || '工作台' }}</button>
+            <span v-else>{{ route.meta.group || '工作台' }}</span>
+            <b>/</b>
+            <strong>{{ route.meta.title }}</strong>
+          </span>
+        </div>
         <div class="top-right"><span class="avatar">{{ auth.username?.slice(0, 1).toUpperCase() || 'A' }}</span><span class="user-name">{{ auth.username || 'admin' }}</span><el-button text @click="signOut">退出</el-button></div>
       </header>
       <main class="page"><router-view /></main>
