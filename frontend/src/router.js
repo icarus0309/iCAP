@@ -1,5 +1,10 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
+/**
+ * meta.parent 指向上级页面的路径，用于顶栏面包屑的「返回上级」箭头与上级标题跳转。
+ * 只给二级页面的子页面声明（如 /evaluations/:id → /evaluations）；一级页面不声明，
+ * 因此顶栏只显示「分组 / 页面」，不出现返回箭头。
+ */
 const routes = [
   { path: '/login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
   { path: '/register', component: () => import('./views/Register.vue'), meta: { title: '注册', public: true } },
@@ -13,6 +18,9 @@ const routes = [
   { path: '/datasets', component: () => import('./views/Datasets.vue'), meta: { title: '数据集仓库', group: '数据与评测' } },
   { path: '/data-tools', component: () => import('./views/DataTools.vue'), meta: { title: '数据标注与治理', group: '数据与评测' } },
   { path: '/evaluations', component: () => import('./views/Evaluations.vue'), meta: { title: '评测任务', group: '数据与评测' } },
+  { path: '/evaluations/:id', component: () => import('./views/EvaluationDetail.vue'),
+    props: (route) => ({ id: route.params.id }),
+    meta: { title: '评测详情', group: '数据与评测', parent: '/evaluations' } },
   { path: '/reports', component: () => import('./views/Reports.vue'), meta: { title: '评测报告', group: '数据与评测' } },
   { path: '/agents', component: () => import('./views/Agents.vue'), meta: { title: 'Agent 工作台', group: 'Agent 应用' } },
   { path: '/school', component: () => import('./views/School.vue'), meta: { title: 'AI School', group: 'AI School' } },
@@ -21,6 +29,7 @@ const routes = [
 ]
 
 const router = createRouter({ history: createWebHistory(), routes })
+export { routes }
 router.beforeEach((to) => {
   if ((!to.meta.public || to.meta.requiresAuth) && !localStorage.getItem('ic_token')) return { path: '/login', query: { redirect: to.fullPath } }
   if (to.meta.public && !to.meta.requiresAuth && localStorage.getItem('ic_token')) return '/'
