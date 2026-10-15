@@ -50,12 +50,8 @@ class EvaluationRunner:
         self._sessions: dict[str, _Session] = {}
 
     def snapshot_task(self, task_id: str) -> dict | None:
-        def read(data):
-            for t in data["evaluations"]:
-                if t["id"] == task_id:
-                    return t
-            return None
-        return self.store.update(read)
+        data = self.store.snapshot()
+        return next((t for t in data["evaluations"] if t["id"] == task_id), None)
 
     # ---- 公开入口：advance_jobs 每 tick 调用一次 ----
     async def step(self) -> None:
