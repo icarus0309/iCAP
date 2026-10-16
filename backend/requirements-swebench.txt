@@ -1,0 +1,3 @@
+# 第一版评测引擎可选依赖（swebench_verified benchmark + mini_swe_agent harness）
+swebench==4.1.0
+mini-swe-agent==2.4.5

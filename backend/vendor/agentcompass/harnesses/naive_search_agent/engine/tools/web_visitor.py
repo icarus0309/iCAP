@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+Web Visitor Tool (standalone version)
+Fetches web pages via Jina Reader + extracts summaries with LLM, usable as a direct function call.
+Reference: https://github.com/Alibaba-NLP/DeepResearch/blob/main/inference/tool_visit.py
+"""
+import asyncio
+import json
+import logging
+import os
+import random
+from typing import Any, List, Optional, Union
+
+import aiohttp
+import httpx
+from openai import APITimeoutError
+
+from agentcompass.runtime.llm import (ApiProtocol, OpenAIChatClient, OpenAIResponsesClient,
+                                      response_to_chat_completion_like, select_api_protocol)
+
+logger = logging.getLogger(__name__)
+
+# Web fetching config
+JINA_URL = "https://r.jina.ai/"
+
+# Content truncation config
+MAX_CONTENT_CHARS = 150000
+MAX_SUMMARY_RETRIES = 3
+MAX_PARSE_RETRIES = 3
+
+# HTTP statuses that signal a malformed request, broken credential, or exhausted
+# quota. Retrying cannot fix these, so they are surfaced once instead of being
+# folded into the retry noise.
+_FATAL_HTTP_STATUSES = frozenset({400, 401, 402, 403, 429})
+_reported_fatal_statuses: set[int] = set()
+
+# =============================================================================
+# Prompt (reference: DeepResearch)
+# =============================================================================
+EXTRACTOR_PROMPT = """Please process the following webpage content and user goal to extract relevant information:
+
+## **Webpage Content**
+{webpage_content}
+
+## **User Goal**
+{goal}
+
+## **Task Guidelines**
+1. **Content Scanning for Rationale**: Locate the **specific sections/data** directly related to the user's goal within the webpage content
+2. **Key Extraction for Evidence**: Identify and extract the **most relevant information** from the content, you never miss any important information, output the **full original context** of the content as far as possible, it can be more than three paragraphs.
+3. **Summary Output for Summary**: Organize into a concise paragraph with logical flow, prioritizing clarity and judge the contribution of the information to the goal.
+
+**Final Output Format using JSON format has "rational", "evidence", "summary" fields**
+"""
+
+FAILED_MSG_TEMPLATE = ('The useful information in {url} for user goal {goal} as follows: \n\n'
+                       'Evidence in page: \n'
+                       'The provided webpage content could not be accessed. '
+                       'Please check the URL or file format.\n\n'
+                       'Summary: \n'
+                       'The webpage content could not be processed, and therefore, '
+                       'no information is available.\n\n')
+
+
+# =============================================================================
+# Text Truncation
+# =============================================================================
+def truncate_text(text: str, max_chars: int = MAX_CONTENT_CHARS) -> str:
+    """Truncate text by character length, keeping the head."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
+
+
+# =============================================================================
+# Web Fetching (direct Jina API call, no browse service dependency)
+# =============================================================================
+async def fetch_page(
+    url: str,
+    session: aiohttp.ClientSession,
+    *,
+    jina_api_key: str,
+    jina_timeout: int,
+    jina_max_retries: int,
+) -> str:
+    """Fetch web page content via Jina Reader with retries.
+
+    Per-attempt failures are transient and already handled by the retry loop, so they
+    are logged at DEBUG. Only a URL that exhausts every attempt is worth a WARNING.
+    """
+    proxy_url = os.environ.get("https_proxy") or os.environ.get("http_proxy")
+    headers = {
+        "Authorization": f"Bearer {jina_api_key}",
+        "Accept": "text/plain",
+        "X-Return-Format": "text",
+        "X-Timeout": str(jina_timeout),
+    }
+    request_kwargs: dict[str, Any] = {
+        "headers": headers,
+        "timeout": aiohttp.ClientTimeout(total=jina_timeout),
+    }
+    if proxy_url != "":
+        request_kwargs["proxy"] = proxy_url
+        request_kwargs["ssl"] = False
+
+    last_failure = "no attempt was made"
+    for attempt in range(jina_max_retries):
+        try:
+            async with session.get(f"{JINA_URL}{url}", **request_kwargs) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+                last_failure = f"HTTP {resp.status}"
+                if resp.status in _FATAL_HTTP_STATUSES:
+                    # Malformed requests and credential/quota problems need correction
+                    # or operator action, not another retry.
+                    if resp.status not in _reported_fatal_statuses:
+                        _reported_fatal_statuses.add(resp.status)
+                        logger.error(
+                            "Jina Reader rejected the request with HTTP %d "
+                            "(check the URL, jina_api_key, or quota); further occurrences are suppressed",
+                            resp.status,
+                        )
+                    return ""
+                logger.debug("fetch_page attempt %d got HTTP %d for %s", attempt + 1, resp.status, url)
+        except Exception as e:
+            last_failure = f"{type(e).__name__}: {e}"
+            logger.debug("fetch_page attempt %d failed for %s: %s", attempt + 1, url, e)
+            await asyncio.sleep(0.5)
+    logger.warning("fetch_page gave up on %s after %d attempts (last: %s)", url, jina_max_retries, last_failure)
+    return ""
+
+
+# =============================================================================
+# LLM Client
+# =============================================================================
+class LLMClient:
+    """Lightweight LLM client, depends only on openai SDK."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        base_url: str,
+        api_key: str,
+        timeout: int,
+        max_retry: int,
+        sleep_interval: int,
+        api_protocol: str | List[str] = "",
+        model_infer_params: dict[str, Any] | None = None,
+        task_id: str = "unknown",
+    ):
+        urls = [u.strip() for u in base_url.split(",") if u.strip()]
+        if not urls:
+            raise RuntimeError("Web visitor requires a non-empty base_url")
+
+        self.model_name = model_name
+        self.max_retry = max_retry
+        self.sleep_interval = sleep_interval
+        self.timeout = timeout
+        self.model_infer_params = dict(model_infer_params or {})
+        self.api_protocol = select_api_protocol(
+            api_protocol,
+            {ApiProtocol.OPENAI_CHAT, ApiProtocol.OPENAI_RESPONSES},
+            component="web_visitor",
+        )
+        self.use_responses_api = self.api_protocol == ApiProtocol.OPENAI_RESPONSES
+        self.task_id = str(task_id or "unknown")
+        self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        protocol_client = OpenAIResponsesClient if self.use_responses_api else OpenAIChatClient
+        self.clients = [protocol_client(api_key=api_key, base_url=u, http_client=self.http_client) for u in urls]
+
+    async def chat(self, messages: list[dict]) -> str:
+        """Run one completion, retrying transient failures.
+
+        Individual attempts log at DEBUG; only exhausting every retry warns.
+        """
+        for attempt in range(self.max_retry):
+            try:
+                client = random.choice(self.clients)
+                resp = await self._request_completion(client, messages=messages)
+                if self.use_responses_api:
+                    return response_to_chat_completion_like(resp, default_model=self.model_name).content
+                return resp.choices[0].message.content or ""
+            except (APITimeoutError, TimeoutError) as e:
+                if attempt == self.max_retry - 1:
+                    logger.warning("LLM timed out after %d attempts: %s", self.max_retry, e)
+                    return ""
+                logger.debug("LLM timeout attempt %d: %s", attempt + 1, e)
+                await asyncio.sleep(self.sleep_interval)
+            except Exception as e:
+                if attempt == self.max_retry - 1:
+                    logger.warning("LLM failed after %d attempts: %s: %s", self.max_retry, type(e).__name__, e)
+                    return ""
+                logger.debug("LLM error attempt %d: %s", attempt + 1, e)
+                await asyncio.sleep(self.sleep_interval)
+        return ""
+
+    async def _request_completion(self, client, *, messages: list[dict]):
+        """Issue one completion through the selected public protocol client."""
+        if self.use_responses_api:
+            return await client.generate(
+                model=self.model_name,
+                input=messages,
+                model_params=dict(self.model_infer_params),
+                timeout=self.timeout,
+            )
+        return await client.generate(
+            model=self.model_name,
+            messages=messages,
+            model_params=dict(self.model_infer_params),
+            timeout=self.timeout,
+        )
+
+    async def close(self) -> None:
+        await self.http_client.aclose()
+
+
+# =============================================================================
+# Page Content Extraction (reference: DeepResearch readpage_jina flow)
+# =============================================================================
+async def extract_page_info(url: str, goal: str, content: str, llm: LLMClient) -> str:
+    """Extract goal-related information from web page content using LLM."""
+    content = truncate_text(content)
+    prompt = EXTRACTOR_PROMPT.format(webpage_content=content, goal=goal)
+    messages = [{"role": "user", "content": prompt}]
+
+    raw = await llm.chat(messages)
+
+    # If response is too short, retry with progressively shorter content
+    retries = MAX_SUMMARY_RETRIES
+    while len(raw) < 10 and retries > 0:
+        truncate_len = int(0.7 * len(content)) if retries > 1 else 25000
+        logger.info("extract retry for %s, truncating to %d chars", url, truncate_len)
+        content = content[:truncate_len]
+        prompt = EXTRACTOR_PROMPT.format(webpage_content=content, goal=goal)
+        messages = [{"role": "user", "content": prompt}]
+        raw = await llm.chat(messages)
+        retries -= 1
+
+    # Parse JSON
+    if isinstance(raw, str):
+        raw = raw.replace("```json", "").replace("```", "").strip()
+
+    parsed = None
+    for _ in range(MAX_PARSE_RETRIES):
+        try:
+            parsed = json.loads(raw)
+            break
+        except (json.JSONDecodeError, TypeError):
+            raw = await llm.chat(messages)
+            if isinstance(raw, str):
+                raw = raw.replace("```json", "").replace("```", "").strip()
+
+    if parsed is None:
+        return FAILED_MSG_TEMPLATE.format(url=url, goal=goal)
+
+    return (f"The useful information in {url} for user goal {goal} as follows: \n\n"
+            f"Evidence in page: \n{parsed.get('evidence', '')}\n\n"
+            f"Summary: \n{parsed.get('summary', '')}\n\n")
+
+
+# =============================================================================
+# Single URL Processing Flow
+# =============================================================================
+async def visit_single_url(
+    url: str,
+    goal: str,
+    llm: LLMClient,
+    session: aiohttp.ClientSession,
+    *,
+    jina_api_key: str,
+    jina_timeout: int,
+    jina_max_retries: int,
+) -> str:
+    """Fetch a single URL and extract information using LLM."""
+    content = await fetch_page(
+        url,
+        session,
+        jina_api_key=jina_api_key,
+        jina_timeout=jina_timeout,
+        jina_max_retries=jina_max_retries,
+    )
+    if not content:
+        return FAILED_MSG_TEMPLATE.format(url=url, goal=goal)
+    return await extract_page_info(url, goal, content, llm)
+
+
+def _normalize_visit_urls(url: Union[str, List[str]]) -> Union[str, List[str]]:
+    """Recover a URL list when a model serializes it as a JSON string.
+
+    The tool schema accepts either a URL or a list of URLs. Some providers/models
+    nevertheless encode the nested list as a string in the outer tool arguments,
+    e.g. ``{"url": "[\"https://example.com\"]"}``. Decode only a
+    string that looks like a JSON array and only accept a list of strings; other
+    string inputs retain their original single-URL behavior.
+    """
+    if not isinstance(url, str):
+        return url
+
+    candidate = url.strip()
+    if not (candidate.startswith("[") and candidate.endswith("]")):
+        return url
+
+    try:
+        parsed = json.loads(candidate)
+    except (TypeError, ValueError, RecursionError):
+        return url
+
+    if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+        return parsed
+    return url
+
+
+class WebVisitorTool:
+    """Request-scoped web visitor tool with isolated LLM client state."""
+
+    def __init__(
+        self,
+        *,
+        jina_api_key: str = "",
+        model_name: str = "",
+        base_url: str = "",
+        api_key: str = "",
+        task_id: str = "unknown",
+        request_timeout: int = 2000,
+        max_retry: int = 10,
+        retry_interval: int = 5,
+        api_protocol: str | List[str] = "",
+        model_infer_params: dict[str, Any] | None = None,
+    ):
+        if not model_name:
+            raise RuntimeError("Web visitor requires MODEL_NAME or llm_config.model_name")
+        if not base_url:
+            raise RuntimeError("Web visitor requires llm_config.url")
+        if not api_key:
+            raise RuntimeError("Web visitor requires llm_config.api_key")
+
+        self.jina_api_key = jina_api_key
+        self.llm_timeout = max(1, int(request_timeout))
+        self.jina_timeout = max(1, self.llm_timeout // 2)
+        self.jina_max_retries = max(1, int(max_retry))
+        self.llm = LLMClient(
+            model_name=model_name,
+            base_url=base_url,
+            api_key=api_key,
+            task_id=task_id,
+            api_protocol=api_protocol,
+            model_infer_params=model_infer_params,
+            timeout=self.llm_timeout,
+            max_retry=max(1, int(max_retry)),
+            sleep_interval=max(0, int(retry_interval)),
+        )
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create the request-scoped fetch session."""
+        async with self._session_lock:
+            if self._http_session is None or self._http_session.closed:
+                self._http_session = aiohttp.ClientSession()
+            return self._http_session
+
+    async def visit(self, url: Union[str, List[str]], goal: str) -> str:
+        """Visit webpage(s) and return the summary of the content."""
+        session = await self._get_session()
+        url = _normalize_visit_urls(url)
+
+        if isinstance(url, str):
+            try:
+                return await visit_single_url(
+                    url,
+                    goal,
+                    self.llm,
+                    session,
+                    jina_api_key=self.jina_api_key,
+                    jina_timeout=self.jina_timeout,
+                    jina_max_retries=self.jina_max_retries,
+                )
+            except Exception:
+                return FAILED_MSG_TEMPLATE.format(url=url, goal=goal)
+
+        results = []
+        for current_url in url:
+            try:
+                result = await visit_single_url(
+                    current_url,
+                    goal,
+                    self.llm,
+                    session,
+                    jina_api_key=self.jina_api_key,
+                    jina_timeout=self.jina_timeout,
+                    jina_max_retries=self.jina_max_retries,
+                )
+            except Exception as e:
+                result = f"Error fetching {current_url}: {e}"
+            results.append(result)
+
+        return "\n=======\n".join(results)
+
+    async def close(self) -> None:
+        session = None
+        async with self._session_lock:
+            session = self._http_session
+            self._http_session = None
+
+        try:
+            if session is not None and not session.closed:
+                await session.close()
+        finally:
+            await self.llm.close()
+
+
+# Tool schema (for registry, compatible with original MCP tool schema)
+TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "visit",
+        "description": "Visit webpage(s) and return the summary of the content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "oneOf": [{
+                        "type": "string"
+                    }, {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        }
+                    }],
+                    "description": "The URL(s) of the webpage(s) to visit. Can be a single URL or an array of URLs."
+                },
+                "goal": {
+                    "type": "string",
+                    "description": "The goal of the visit for webpage(s)."
+                }
+            },
+            "required": ["url", "goal"]
+        }
+    }
+}

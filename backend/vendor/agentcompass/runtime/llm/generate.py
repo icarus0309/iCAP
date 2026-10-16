@@ -1,0 +1,238 @@
+"""Small helpers for direct model API calls from runtime components."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from agentcompass.runtime.llm.anthropic import AnthropicMessagesClient
+from agentcompass.runtime.llm.openai import (OpenAIChatClient, OpenAIResponsesClient, chat_messages_to_responses_input,
+                                             response_to_chat_completion_like)
+from agentcompass.runtime.llm.protocol import ApiProtocol, select_api_protocol
+
+if TYPE_CHECKING:
+    from agentcompass.runtime.models import ModelSpec
+
+# OpenAI/Anthropic SDK kwargs that must be set on the client constructor, not
+# per-request via .create(). Anything else in user-supplied params goes through
+# to .create() unchanged.
+_CLIENT_LEVEL_KWARGS = ("max_retries", )
+
+# AgentCompass framework defaults for client reliability knobs. Applied via
+# setdefault, so user values in judge_model.params (or other spec.params) win.
+# Override per-call by passing the kwarg via spec.params; remove framework
+# defaults entirely by editing the dicts below.
+_FRAMEWORK_CLIENT_DEFAULTS: dict[str, Any] = {"max_retries": 3}
+_FRAMEWORK_REQUEST_DEFAULTS: dict[str, Any] = {"timeout": 1000}
+
+
+def _split_client_kwargs(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split params into (client-constructor kwargs, per-request kwargs)."""
+    client_only: dict[str, Any] = {}
+    request_only = dict(params)
+    for key in _CLIENT_LEVEL_KWARGS:
+        if key in request_only:
+            client_only[key] = request_only.pop(key)
+    return client_only, request_only
+
+
+def _apply_framework_defaults(
+    client_kwargs: dict[str, Any],
+    request_kwargs: dict[str, Any],
+) -> None:
+    """Fill in framework reliability defaults without overwriting user values."""
+    for key, value in _FRAMEWORK_CLIENT_DEFAULTS.items():
+        client_kwargs.setdefault(key, value)
+    for key, value in _FRAMEWORK_REQUEST_DEFAULTS.items():
+        request_kwargs.setdefault(key, value)
+
+
+def normalize_model_spec(
+    spec: str | dict[str, Any] | ModelSpec,
+    *,
+    fallback: ModelSpec | None = None,
+    default_params: dict[str, Any] | None = None,
+) -> ModelSpec:
+    """Build a ModelSpec from a user-facing model spec."""
+    from agentcompass.runtime.models import ModelSpec
+
+    params = dict(default_params or {})
+    if isinstance(spec, ModelSpec):
+        params.update(spec.params)
+        return ModelSpec(
+            id=spec.id,
+            base_url=spec.base_url,
+            api_key=spec.raw_api_key,
+            api_protocol=spec.api_protocol,
+            params=params,
+            wrap_api_key=spec.wrap_api_key,
+        )
+
+    fallback_base_url = fallback.base_url if fallback else ""
+    fallback_api_key = fallback.raw_api_key if fallback else ""
+    fallback_api_protocol = fallback.api_protocol if fallback else ""
+
+    if isinstance(spec, dict):
+        payload = dict(spec)
+        params.update(dict(payload.get("params") or {}))
+        return ModelSpec(
+            id=str(payload.get("id") or "").strip(),
+            base_url=str(payload["base_url"]).strip() if "base_url" in payload else fallback_base_url,
+            api_key=str(payload["api_key"]).strip() if "api_key" in payload else fallback_api_key,
+            api_protocol=payload["api_protocol"] if "api_protocol" in payload else fallback_api_protocol,
+            params=params,
+            wrap_api_key=payload.get("wrap_api_key", fallback.wrap_api_key if fallback else False),
+        )
+
+    return ModelSpec(
+        id=str(spec or "").strip(),
+        base_url=fallback_base_url,
+        api_key=fallback_api_key,
+        api_protocol=fallback_api_protocol,
+        params=params,
+        wrap_api_key=fallback.wrap_api_key if fallback else False,
+    )
+
+
+@dataclass(slots=True)
+class GeneratedText:
+    """Text plus the provider's stop signal.
+
+    ``stop_reason`` mirrors the OpenAI chat-completions ``finish_reason``
+    (``"stop"``, ``"length"``, ``"tool_calls"``, ...). The Responses and
+    Anthropic protocols are projected onto the same vocabulary, so callers can
+    test for ``"length"`` regardless of protocol. It is ``None`` when the
+    provider did not report one.
+    """
+
+    text: str
+    stop_reason: str | None
+
+
+async def generate_text(
+    model: ModelSpec,
+    messages: list[dict[str, Any]],
+    **params: Any,
+) -> str:
+    """Call a configured model spec and return text content using native coroutines.
+
+    Merge order: call-site `**params` provide defaults, `model.params` overrides them.
+    This lets users tune behavior (timeout, max_retries, generation kwargs) via the
+    spec dict's `params:` block without scorer-side code changes.
+    """
+    return (await generate_with_metadata(model, messages, **params)).text
+
+
+async def generate_with_metadata(
+    model: ModelSpec,
+    messages: list[dict[str, Any]],
+    **params: Any,
+) -> GeneratedText:
+    """Like :func:`generate_text`, but also returns the provider's stop reason.
+
+    Use this when a truncated response must be distinguished from a short one --
+    for example, article cleaning splits its input and retries on ``"length"``
+    rather than treating the short output as a valid result.
+    """
+    call_params = dict(params)
+    call_params.update(model.params)
+    protocol = select_api_protocol(
+        model.api_protocol,
+        [ApiProtocol.OPENAI_CHAT, ApiProtocol.OPENAI_RESPONSES, ApiProtocol.ANTHROPIC],
+        component="runtime.llm.generate",
+        default=ApiProtocol.OPENAI_CHAT,
+    ).lower()
+
+    if protocol == ApiProtocol.OPENAI_CHAT:
+        return await _openai_chat_completion_text_async(model, messages, call_params)
+    if protocol == ApiProtocol.OPENAI_RESPONSES:
+        return await _openai_responses_completion_text_async(model, messages, call_params)
+    if protocol == ApiProtocol.ANTHROPIC:
+        return await _anthropic_messages_completion_text_async(model, messages, call_params)
+
+    raise ValueError(f"unsupported model api_protocol: {model.api_protocol}")
+
+
+async def _openai_chat_completion_text_async(
+    model: ModelSpec,
+    messages: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> GeneratedText:
+    client_kwargs: dict[str, Any] = {}
+    if model.base_url:
+        client_kwargs["base_url"] = model.base_url
+    if model.api_key:
+        client_kwargs["api_key"] = model.api_key
+    client_extra, request_params = _split_client_kwargs(params)
+    client_kwargs.update(client_extra)
+    _apply_framework_defaults(client_kwargs, request_params)
+    timeout = request_params.pop("timeout", None)
+    async with OpenAIChatClient(**client_kwargs) as client:
+        response = await client.generate(
+            model=model.id,
+            messages=messages,
+            model_params=request_params,
+            timeout=timeout,
+        )
+    if not response.choices:
+        return GeneratedText("", None)
+    choice = response.choices[0]
+    return GeneratedText(choice.message.content or "", getattr(choice, "finish_reason", None))
+
+
+async def _openai_responses_completion_text_async(
+    model: ModelSpec,
+    messages: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> GeneratedText:
+    client_kwargs: dict[str, Any] = {}
+    if model.base_url:
+        client_kwargs["base_url"] = model.base_url
+    if model.api_key:
+        client_kwargs["api_key"] = model.api_key
+    client_extra, request_params = _split_client_kwargs(params)
+    client_kwargs.update(client_extra)
+    _apply_framework_defaults(client_kwargs, request_params)
+    timeout = request_params.pop("timeout", None)
+    async with OpenAIResponsesClient(**client_kwargs) as client:
+        response = await client.generate(
+            model=model.id,
+            input=chat_messages_to_responses_input(messages),
+            model_params=request_params,
+            timeout=timeout,
+        )
+    projected = response_to_chat_completion_like(response, default_model=model.id)
+    return GeneratedText(projected.content, projected.stop_reason)
+
+
+async def _anthropic_messages_completion_text_async(
+    model: ModelSpec,
+    messages: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> GeneratedText:
+    client_kwargs: dict[str, Any] = {}
+    if model.base_url:
+        client_kwargs["base_url"] = model.base_url
+    if model.api_key:
+        client_kwargs["api_key"] = model.api_key
+
+    client_extra, request_params = _split_client_kwargs(params)
+    client_kwargs.update(client_extra)
+    _apply_framework_defaults(client_kwargs, request_params)
+
+    async with AnthropicMessagesClient(**client_kwargs) as client:
+        response = await client.generate(
+            model=model.id,
+            messages=messages,
+            model_params=request_params,
+        )
+    chunks: list[str] = []
+    for content in getattr(response, "content", None) or []:
+        text = getattr(content, "text", None)
+        if text:
+            chunks.append(str(text))
+    # Anthropic's "max_tokens" is the same condition as OpenAI's "length".
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason == "max_tokens":
+        stop_reason = "length"
+    return GeneratedText("\n".join(chunks), stop_reason)

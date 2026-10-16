@@ -1,0 +1,5 @@
+# 行尾符规范化：文本文件统一 LF 入库，checkout 时按平台自动转换
+* text=auto
+
+# shell 脚本强制 LF（Windows checkout 成 CRLF 会导致 bash shebang 失败）
+*.sh text eol=lf
