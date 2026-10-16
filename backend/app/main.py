@@ -29,6 +29,8 @@ from .access import Visibility, can_view, ownership, require_edit, require_view,
 from .auth import AuthService, source_ip
 from .evaluation import (RULER_IDS, RULER_SPECS, EvaluationRunner, flatten_cases,
                          get_cases_for_ruler, get_ruler_spec)
+from .evaluation.agentcompass_adapter import (AGENTCOMPASS_BENCHMARKS, AGENTCOMPASS_IDS,
+                                              AgentCompassRunner)
 from .model_registry import ModelInput, ModelRegistry
 from .store import Store
 
@@ -220,11 +222,12 @@ def simulate_legacy_evaluations(store: Store) -> None:
     Ruler1/Ruler2 任务由 EvaluationRunner 真实推进，不在本函数处理范围内。
     """
     if not any(task["status"] in ("queued", "running") and task["benchmark"] not in RULER_IDS
+               and task["benchmark"] not in AGENTCOMPASS_IDS
                and not task.get("ruler_label") for task in store.snapshot()["evaluations"]):
         return
     def tick(data: dict) -> None:
         for task in data["evaluations"]:
-            if task["benchmark"] in RULER_IDS or task.get("ruler_label"):
+            if task["benchmark"] in RULER_IDS or task["benchmark"] in AGENTCOMPASS_IDS or task.get("ruler_label"):
                 continue
             if task["status"] not in ("queued", "running"):
                 continue
@@ -252,8 +255,9 @@ def simulate_legacy_evaluations(store: Store) -> None:
     store.update(tick)
 
 
-async def advance_jobs(store: Store, stop: asyncio.Event, runner: EvaluationRunner, worker_tick: float) -> None:
-    """调度循环：学校任务与旧 benchmark 走模拟，Ruler1/Ruler2 走真实测评引擎。"""
+async def advance_jobs(store: Store, stop: asyncio.Event, runner: EvaluationRunner,
+                       agent_runner: AgentCompassRunner, worker_tick: float) -> None:
+    """调度循环：学校任务与旧 benchmark 走模拟，Ruler1/Ruler2 与 Agent 评测走真实引擎。"""
     step_timeout = max(worker_tick * 40, 30.0)  # 最后防线：极端卡死时取消本轮 step
     idle = False
     while not stop.is_set():
@@ -268,6 +272,12 @@ async def advance_jobs(store: Store, stop: asyncio.Event, runner: EvaluationRunn
             raise
         except Exception as exc:                                   # 引擎异常不允许拖垮调度循环
             print(f"[evaluation] 调度异常：{exc}", flush=True)
+        try:
+            await agent_runner.step()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                                   # Agent 引擎异常不拖垮调度循环
+            print(f"[agent-evaluation] 调度异常：{exc}", flush=True)
         if runner.active_task_id is None and not idle:
             idle = True
             runner.shutdown()
@@ -292,14 +302,22 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
     registry = ModelRegistry(store)
     stop = asyncio.Event()
     runner = EvaluationRunner(store, registry, live=(not demo), stop=stop)
+    agent_runner = AgentCompassRunner(
+        store, registry,
+        data_dir=os.getenv("AGENTCOMPASS_DATA_DIR", str(base / "agentcompass")),
+        results_dir=os.getenv("AGENTCOMPASS_RESULTS_DIR", str(base / "agentcompass_results")),
+        stop=stop,
+        enabled=(os.getenv("AGENTCOMPASS_ENABLED", "false").lower() == "true"),
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        worker = asyncio.create_task(advance_jobs(store, stop, runner, worker_tick))
+        worker = asyncio.create_task(advance_jobs(store, stop, runner, agent_runner, worker_tick))
         yield
         stop.set()
         await worker
         runner.shutdown()
+        agent_runner.shutdown()
 
     app = FastAPI(title="InnovationCore AI Platform", version="0.1.0", lifespan=lifespan)
     app.state.store = store
@@ -459,6 +477,11 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
                         "available_cases": len(cases)})
         return {"rulers": out}
 
+    @app.get("/api/agent-benchmarks", dependencies=[Depends(authorized)])
+    def agent_benchmarks():
+        """返回已接入 AgentCompass 的 benchmark 映射（第一版 Dev → swebench_verified）。"""
+        return {"benchmarks": AGENTCOMPASS_BENCHMARKS}
+
     @app.get("/api/recommendations")
     def recommendations(scenario: Literal["language", "code", "reasoning", "vision", "telecom"] = "language",
                         principal: dict = Depends(authorized)):
@@ -608,6 +631,12 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
                 "sample_limit": spec.default_sample_limit,          # batch 不传 config → 默认
                 "sample_limits": None,
                 "max_tokens": 1024, "temperature": 0.0, "sync_scores": False}
+            item["result"] = None
+        if benchmark in AGENTCOMPASS_IDS:
+            mapping = AGENTCOMPASS_BENCHMARKS[benchmark]
+            item["agent"] = {"benchmark": mapping["benchmark"], "harness": mapping["harness"],
+                             "environment": mapping["environment"]}
+            item["simulated"] = False
             item["result"] = None
         return item
 
