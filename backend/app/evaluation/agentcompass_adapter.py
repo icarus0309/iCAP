@@ -1,6 +1,6 @@
 """iCAP 侧 AgentCompass 评测执行器（进程内 vendor 适配层）。
 
-把 iCAP 评测任务（Dev 域）通过进程内 async_run_evaluation 转成真实 Agent 评测。
+把 iCAP 评测任务（Agent 域）通过进程内 async_run_evaluation 转成真实 Agent 评测。
 进度经 on_progress 回调写回 store，完成后读 results 目录生成平台报告。
 AgentCompass 原生结果目录/产物原样保留，本模块只读不改。
 """
@@ -20,19 +20,68 @@ _VENDOR_DIR = Path(__file__).resolve().parents[2] / "vendor"
 if str(_VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(_VENDOR_DIR))
 
-# iCAP benchmark 枚举值 → AgentCompass 组件映射（第一版只接 Dev）
-AGENTCOMPASS_BENCHMARKS: dict[str, dict] = {
-    "Dev": {
-        "benchmark": "swebench_verified",
-        "harness": "mini_swe_agent",
-        "environment": "docker",
-        "model_api_protocol": "openai-chat",
-        "harness_params": {"step_limit": 100, "command_timeout": 2400},
-        "environment_params": {"resources": {"cpu": 2, "memory_mb": 4096}},
-        "benchmark_params": {},
-    },
+# iCAP 评测枚举值：Agent 域统一走 AgentCompass 真实评测。
+AGENTCOMPASS_BENCHMARK_ID = "Agent"
+AGENTCOMPASS_IDS = frozenset({AGENTCOMPASS_BENCHMARK_ID})
+
+# 能力白名单 manifest：只暴露本地有 data、且配「纯 Python + LLM 直连」harness 的组合。
+# 排除：claude_code/codex/pi/hermes/openclaw/openhands/openevolve/terminus2/aisf_agent/
+#       qwen3vl_gui/scicode_tool_use/researchharness，及 benchmark aisf_iot/terminalbench2_1。
+AGENTCOMPASS_CAPABILITIES: dict[str, list[dict]] = {
+    "benchmarks": [
+        {"id": "swebench_verified", "label": "SWE-bench Verified",
+         "description": "SWE-bench: Can Language Models Resolve Real-World GitHub Issues? "
+                        "(https://arxiv.org/abs/2310.06770). AgentCompass uses the SWE-bench Verified subset.",
+         "suggested_harnesses": ["mini_swe_agent"]},
+        {"id": "swebench_lite", "label": "SWE-bench Lite",
+         "description": "SWE-bench: Can Language Models Resolve Real-World GitHub Issues? "
+                        "(https://arxiv.org/abs/2310.06770). AgentCompass uses the SWE-bench Lite subset.",
+         "suggested_harnesses": ["mini_swe_agent"]},
+        {"id": "swebench_pro", "label": "SWE-bench Pro",
+         "description": "SWE-Bench Pro: Can AI Agents Solve Long-Horizon Software Engineering Tasks? "
+                        "(https://arxiv.org/abs/2509.16941).",
+         "suggested_harnesses": ["mini_swe_agent"]},
+        {"id": "gaia", "label": "GAIA",
+         "description": "GAIA: a benchmark for General AI Assistants (https://arxiv.org/abs/2311.12983).",
+         "suggested_harnesses": ["naive_search_agent", "openai_chat"]},
+        {"id": "browsecomp", "label": "BrowseComp",
+         "description": "BrowseComp: A Simple Yet Challenging Benchmark for Browsing Agents "
+                        "(https://arxiv.org/abs/2504.12516).",
+         "suggested_harnesses": ["naive_search_agent"]},
+        {"id": "browsecomp_zh", "label": "BrowseComp-ZH",
+         "description": "BrowseComp-ZH: Benchmarking Web Browsing Ability of Large Language Models in Chinese "
+                        "(https://arxiv.org/abs/2504.19314).",
+         "suggested_harnesses": ["naive_search_agent"]},
+        {"id": "hle", "label": "HLE",
+         "description": "Humanity's Last Exam (https://arxiv.org/abs/2501.14249).",
+         "suggested_harnesses": ["openai_chat"]},
+        {"id": "skillsbench", "label": "SkillsBench",
+         "description": "SkillsBench: Benchmarking How Well Agent Skills Work Across Diverse Tasks "
+                        "(https://arxiv.org/abs/2602.12670).",
+         "suggested_harnesses": ["openai_chat", "mini_swe_agent"]},
+    ],
+    "harnesses": [
+        {"id": "openai_chat", "label": "OpenAI Chat",
+         "description": "直接调用模型，无环境交互，用于问答类 benchmark（GAIA/HLE/SkillsBench）。",
+         "preferred_protocols": ["openai-chat"]},
+        {"id": "mini_swe_agent", "label": "mini-SWE-agent",
+         "description": "Runs mini-SWE-agent for SWE-bench-style repository repair tasks.",
+         "preferred_protocols": ["openai-chat"]},
+        {"id": "naive_search_agent", "label": "NaiveSearchAgent",
+         "description": "AgentCompass 内置搜索 agent，用于 GAIA/BrowseComp 等研究类任务。",
+         "preferred_protocols": ["openai-chat"]},
+    ],
+    "environments": [
+        {"id": "docker", "label": "Docker 容器"},
+        {"id": "host_process", "label": "宿主进程"},
+    ],
+    "protocols": [
+        {"value": "auto", "label": "自动（harness 默认）"},
+        {"value": "openai-chat", "label": "OpenAI Chat Completions"},
+        {"value": "openai-responses", "label": "OpenAI Responses"},
+        {"value": "anthropic", "label": "Anthropic Messages"},
+    ],
 }
-AGENTCOMPASS_IDS = frozenset(AGENTCOMPASS_BENCHMARKS)
 
 
 def now() -> str:
@@ -43,31 +92,45 @@ def build_run_kwargs(task: dict, model: dict, endpoint: dict, api_key: str,
                      *, data_dir: str, results_dir: str) -> dict:
     """纯函数：把 iCAP 任务 + 模型端点组装成 async_run_evaluation 的 kwargs。
 
-    model_base_url 原样使用端点的 url（base，不含 /chat/completions），
+    组件选择（benchmark/harness/environment/protocol/params）直接读 task["agent"]，
+    不再查硬编码映射表。model_base_url 原样使用端点的 url（base，不含 /chat/completions），
     由 AgentCompass 按 protocol 拼接，iCAP 不自行拼路径。
     """
-    mapping = AGENTCOMPASS_BENCHMARKS[task["benchmark"]]
-    config = task.get("config") or {}
-    benchmark_params = dict(mapping.get("benchmark_params") or {})
-    if config.get("sample_ids"):
-        benchmark_params["sample_ids"] = [str(x) for x in config["sample_ids"]]
-    return {
-        "benchmark": mapping["benchmark"],
-        "harness": mapping["harness"],
+    agent = task.get("agent") or {}
+    benchmark = agent.get("benchmark")
+    harness = agent.get("harness")
+    if not benchmark or not harness:
+        raise ValueError("agent 配置缺少 benchmark/harness")
+    environment = agent.get("environment") or "docker"
+    protocol = agent.get("model_api_protocol") or ""
+    if protocol == "auto":
+        protocol = ""  # 空 = harness 默认协议
+    params = agent.get("params") or {}
+
+    benchmark_params: dict[str, Any] = {}
+    if params.get("sample_ids"):
+        benchmark_params["sample_ids"] = [str(x) for x in params["sample_ids"]]
+
+    kwargs: dict[str, Any] = {
+        "benchmark": benchmark,
+        "harness": harness,
         "model": model["id"],
-        "environment": mapping["environment"],
+        "environment": environment,
         "model_base_url": (endpoint.get("url") or "").rstrip("/"),
         "model_api_key": api_key or "",
-        "model_api_protocol": mapping["model_api_protocol"],
-        "harness_params": dict(mapping.get("harness_params") or {}),
-        "environment_params": dict(mapping.get("environment_params") or {}),
-        "benchmark_params": benchmark_params,
+        "model_api_protocol": protocol,
+        "benchmark_params": benchmark_params or None,
         "data_dir": data_dir,
         "results_dir": results_dir,
-        "task_concurrency": 1,
+        "task_concurrency": int(params.get("task_concurrency") or 1),
         "progress": "none",
         "log_level": "ERROR",
     }
+    if params.get("k") is not None:
+        kwargs["k"] = int(params["k"])
+    if params.get("max_retries") is not None:
+        kwargs["max_retries"] = int(params["max_retries"])
+    return kwargs
 
 
 class AgentCompassRunner:
@@ -119,11 +182,15 @@ class AgentCompassRunner:
         return next((t for t in self.store.snapshot()["evaluations"]
                      if t["status"] == "queued" and t["benchmark"] in AGENTCOMPASS_IDS), None)
 
+    def _benchmark_label(self, task: dict) -> str:
+        return (task.get("agent") or {}).get("benchmark") or task.get("benchmark", "")
+
     async def _start(self, task: dict) -> None:
         from agentcompass.launcher import async_run_evaluation  # 延迟 import（依赖就绪后才调用）
 
         task_id = task["id"]
-        self._mark(task_id, status="running", log=f"{now()} 开始执行 {task['benchmark']} 真实评测")
+        self._mark(task_id, status="running",
+                   log=f"{now()} 开始执行 {self._benchmark_label(task)} 真实评测")
         try:
             model = self.registry.get_model(task["model_id"])
             endpoint = self.registry.next_endpoint(model)
@@ -157,7 +224,7 @@ class AgentCompassRunner:
 
     def _find_run_dir(self, task: dict) -> Path | None:
         run_id = self._runs.get(task["id"])
-        benchmark = AGENTCOMPASS_BENCHMARKS[task["benchmark"]]["benchmark"]
+        benchmark = (task.get("agent") or {}).get("benchmark") or ""
         bench_dir = Path(self.results_dir) / benchmark
         if not run_id or not bench_dir.is_dir():
             return None

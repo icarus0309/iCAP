@@ -29,7 +29,7 @@ from .access import Visibility, can_view, ownership, require_edit, require_view,
 from .auth import AuthService, source_ip
 from .evaluation import (RULER_IDS, RULER_SPECS, EvaluationRunner, flatten_cases,
                          get_cases_for_ruler, get_ruler_spec)
-from .evaluation.agentcompass_adapter import (AGENTCOMPASS_BENCHMARKS, AGENTCOMPASS_IDS,
+from .evaluation.agentcompass_adapter import (AGENTCOMPASS_CAPABILITIES, AGENTCOMPASS_IDS,
                                               AgentCompassRunner)
 from .model_registry import ModelInput, ModelRegistry
 from .store import Store
@@ -130,20 +130,31 @@ def resolve_sample_limits(spec, config: dict | None) -> dict[str, int] | None:
     return limits
 
 
+class AgentEvalConfig(BaseModel):
+    """Agent 评测的组件选择与运行参数。benchmark/harness 必填，其余可选。"""
+    benchmark: str = Field(min_length=1, max_length=80)
+    harness: str = Field(min_length=1, max_length=80)
+    environment: str = Field(default="docker", max_length=80)
+    model_api_protocol: str = Field(default="auto", max_length=40)
+    params: dict | None = None  # task_concurrency / k / max_retries / sample_ids
+
+
 class EvalInput(BaseModel):
     model_id: str
-    dataset_id: str
-    benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Dev", "ASR", "MT", "TTS"] = "Ruler1"
+    dataset_id: str | None = None  # Agent 评测不关联数据集
+    benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Agent", "ASR", "MT", "TTS"] = "Ruler1"
     visibility: Visibility = "private"
     config: EvalConfig | None = None
+    agent: AgentEvalConfig | None = None
 
 
 class BatchEvalInput(BaseModel):
     """批量评测请求：不支持 config，子任务使用对应尺子的默认参数。"""
     model_ids: list[str] = Field(min_length=1, max_length=4)
-    dataset_id: str
-    benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Dev", "ASR", "MT", "TTS"] = "Ruler1"
+    dataset_id: str | None = None
+    benchmark: Literal["Ruler1", "Ruler2", "VLM", "AISF", "Agent", "ASR", "MT", "TTS"] = "Ruler1"
     visibility: Visibility = "private"
+    agent: AgentEvalConfig | None = None
 
 
 class AnnotationInput(BaseModel):
@@ -217,9 +228,10 @@ def simulate_school_jobs(store: Store) -> None:
 
 
 def simulate_legacy_evaluations(store: Store) -> None:
-    """未接入测评引擎的 benchmark（VLM/AISF/Dev/ASR/MT/TTS）沿用原模拟执行器。
+    """未接入测评引擎的 benchmark（VLM/AISF/ASR/MT/TTS）沿用原模拟执行器。
 
-    Ruler1/Ruler2 任务由 EvaluationRunner 真实推进，不在本函数处理范围内。
+    Ruler1/Ruler2 任务由 EvaluationRunner 真实推进，Agent 评测由 AgentCompassRunner 真实推进，
+    均不在本函数处理范围内。
     """
     if not any(task["status"] in ("queued", "running") and task["benchmark"] not in RULER_IDS
                and task["benchmark"] not in AGENTCOMPASS_IDS
@@ -355,9 +367,15 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
             # An unstored model is from the public provider catalog.
             return model is None or can_view(model, principal)
 
+        def dataset_allowed(row: dict) -> bool:
+            # 关联用户数据集的评测须数据集可见；Agent 评测无数据集（dataset_id 为空），直接放行
+            if row.get("dataset_id"):
+                return row["dataset_id"] in dataset_ids
+            return row.get("benchmark") in AGENTCOMPASS_IDS
+
         evaluations = [row for row in data["evaluations"]
                        if can_view(row, principal) and model_allowed(row["model_id"])
-                       and row["dataset_id"] in dataset_ids]
+                       and dataset_allowed(row)]
         evaluation_ids = {row["id"] for row in evaluations}
         return {
             "models": [row for row in data["models"] if can_view(row, principal)],
@@ -477,10 +495,10 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
                         "available_cases": len(cases)})
         return {"rulers": out}
 
-    @app.get("/api/agent-benchmarks", dependencies=[Depends(authorized)])
-    def agent_benchmarks():
-        """返回已接入 AgentCompass 的 benchmark 映射（第一版 Dev → swebench_verified）。"""
-        return {"benchmarks": AGENTCOMPASS_BENCHMARKS}
+    @app.get("/api/agent-capabilities", dependencies=[Depends(authorized)])
+    def agent_capabilities():
+        """返回 Agent 评测可用的 benchmark/harness/environment/protocol 白名单。"""
+        return AGENTCOMPASS_CAPABILITIES
 
     @app.get("/api/recommendations")
     def recommendations(scenario: Literal["language", "code", "reasoning", "vision", "telecom"] = "language",
@@ -614,13 +632,14 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
     def evaluations(principal: dict = Depends(authorized)):
         return scoped_data(principal)["evaluations"]
 
-    def _make_eval_item(data: dict, *, benchmark: str, model: dict, dataset_id: str,
+    def _make_eval_item(data: dict, *, benchmark: str, model: dict, dataset_id: str | None,
                         default_log: str, config_raw: EvalConfig | None = None,
-                        owner: dict | None = None, visibility: Visibility = "private") -> dict:
-        """构造评测任务条目。benchmark 为尺子时补齐 ruler_label/config/result，否则保持旧结构。"""
+                        owner: dict | None = None, visibility: Visibility = "private",
+                        agent: AgentEvalConfig | None = None) -> dict:
+        """构造评测任务条目。尺子补齐 ruler_label/config/result，Agent 域补齐 agent 组件配置。"""
+        dataset_name = find(data["datasets"], dataset_id)["name"] if dataset_id else "AgentCompass 内置数据"
         item = {"id": uid("eval"), "model_id": model["id"], "dataset_id": dataset_id,
-                "benchmark": benchmark, "model_name": model["name"],
-                "dataset_name": find(data["datasets"], dataset_id)["name"],
+                "benchmark": benchmark, "model_name": model["name"], "dataset_name": dataset_name,
                 "status": "queued", "progress": 0, "created_at": now(), "updated_at": now(),
                 "logs": [f"{now()} {default_log}"], "report_id": None, "simulated": True,
                 **ownership(owner, visibility)}
@@ -633,9 +652,7 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
                 "max_tokens": 1024, "temperature": 0.0, "sync_scores": False}
             item["result"] = None
         if benchmark in AGENTCOMPASS_IDS:
-            mapping = AGENTCOMPASS_BENCHMARKS[benchmark]
-            item["agent"] = {"benchmark": mapping["benchmark"], "harness": mapping["harness"],
-                             "environment": mapping["environment"]}
+            item["agent"] = agent.model_dump() if agent else {}
             item["simulated"] = False
             item["result"] = None
         return item
@@ -646,12 +663,18 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
         if body.config is not None and body.benchmark in RULER_IDS:
             # 请求期即校验逐维度取样配置，非法维度 key/条数直接 422，不落库
             resolve_sample_limits(get_ruler_spec(body.benchmark), body.config.model_dump())
+        if body.benchmark in AGENTCOMPASS_IDS and body.agent is None:
+            raise HTTPException(422, "Agent 评测需要提供 agent 配置（benchmark/harness）")
+        if body.benchmark not in AGENTCOMPASS_IDS and not body.dataset_id:
+            raise HTTPException(422, "请选择数据集")
 
         def op(data):
-            require_view(find(data["datasets"], body.dataset_id), principal)
+            if body.dataset_id:
+                require_view(find(data["datasets"], body.dataset_id), principal)
             item = _make_eval_item(data, benchmark=body.benchmark, model=model,
                                    dataset_id=body.dataset_id, default_log="任务已提交",
-                                   config_raw=body.config, owner=principal, visibility=body.visibility)
+                                   config_raw=body.config, owner=principal, visibility=body.visibility,
+                                   agent=body.agent)
             data["evaluations"].insert(0, item)
             return item
         return store.update(op)
@@ -660,14 +683,20 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
     def create_batch_evaluations(body: BatchEvalInput, principal: dict = Depends(authorized)):
         if len(set(body.model_ids)) != len(body.model_ids):
             raise HTTPException(422, "模型不能重复")
+        if body.benchmark in AGENTCOMPASS_IDS and body.agent is None:
+            raise HTTPException(422, "Agent 评测需要提供 agent 配置（benchmark/harness）")
+        if body.benchmark not in AGENTCOMPASS_IDS and not body.dataset_id:
+            raise HTTPException(422, "请选择数据集")
         models = [registry.get_model(identifier, principal) for identifier in body.model_ids]
         def op(data):
-            dataset = require_view(find(data["datasets"], body.dataset_id), principal)
+            dataset_id = body.dataset_id
+            if dataset_id:
+                require_view(find(data["datasets"], dataset_id), principal)
             created = []
             for model in models:
                 task = _make_eval_item(data, benchmark=body.benchmark, model=model,
-                                       dataset_id=dataset["id"], default_log="并行评测任务已提交",
-                                       owner=principal, visibility=body.visibility)
+                                       dataset_id=dataset_id, default_log="并行评测任务已提交",
+                                       owner=principal, visibility=body.visibility, agent=body.agent)
                 data["evaluations"].insert(0, task)
                 created.append(task)
             return created

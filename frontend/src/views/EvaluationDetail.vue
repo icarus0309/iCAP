@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { api, readSSE } from '../api'
 import EvalResultPanel from '../components/evaluation/EvalResultPanel.vue'
 import CaseResultTable from '../components/evaluation/CaseResultTable.vue'
+import AgentResultPanel from '../components/evaluation/AgentResultPanel.vue'
 import { useAuth } from '../stores/auth'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -95,7 +96,7 @@ onUnmounted(() => { controller?.abort(); clearTimeout(timer) })
     <div>
       <div class="eyebrow">DATA / EVALUATION / DETAIL</div>
       <h1>
-        {{ task ? `${task.ruler_label || task.benchmark} · ${task.model_name}` : '评测详情' }}
+        {{ task ? `${task.ruler_label || (task.agent && task.agent.benchmark) || task.benchmark} · ${task.model_name}` : '评测详情' }}
       </h1>
       <p class="subtitle">
         <el-button text type="primary" size="small" @click="router.push('/evaluations')">‹ 返回列表</el-button>
@@ -119,8 +120,8 @@ onUnmounted(() => { controller?.abort(); clearTimeout(timer) })
       </div>
       <el-progress :percentage="task.progress" :status="task.status === 'failed' ? 'exception' : undefined" />
       <div class="toolbar section-gap">
-        <el-button v-if="canManage && ['queued', 'running'].includes(task.status)" @click="action('pause')">暂停</el-button>
-        <el-button v-if="canManage && task.status === 'paused'" type="primary" @click="action('resume')">恢复</el-button>
+        <el-button v-if="canManage && !task.agent && ['queued', 'running'].includes(task.status)" @click="action('pause')">暂停</el-button>
+        <el-button v-if="canManage && !task.agent && task.status === 'paused'" type="primary" @click="action('resume')">恢复</el-button>
         <el-button v-if="canManage && isActive" type="danger" plain @click="action('cancel')">取消任务</el-button>
         <el-button v-if="task.status === 'completed'" type="primary" @click="router.push('/reports')">查看报告</el-button>
         <el-button v-if="task.status === 'failed'" type="primary" @click="restart">重新发起</el-button>
@@ -139,11 +140,14 @@ onUnmounted(() => { controller?.abort(); clearTimeout(timer) })
               title="任务已取消" description="取消的任务不生成评测报告，已产生的用例结果不保留。" />
 
     <template v-if="result">
-      <EvalResultPanel class="section-gap" :result="result" :ruler-label="task.ruler_label" />
-      <CaseResultTable :cases="result.cases" />
+      <AgentResultPanel v-if="task.agent" class="section-gap" :result="result" />
+      <template v-else>
+        <EvalResultPanel class="section-gap" :result="result" :ruler-label="task.ruler_label" />
+        <CaseResultTable :cases="result.cases" />
+      </template>
     </template>
     <div v-else-if="isActive" class="notice section-gap">
-      任务完成后将在此展示综合得分、能力雷达图与用例级明细。
+      任务完成后将在此展示评测结果。
     </div>
   </template>
 </template>

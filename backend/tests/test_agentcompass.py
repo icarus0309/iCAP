@@ -1,4 +1,4 @@
-"""AgentCompass 集成测试：映射表、参数组装、报告映射、执行器进度与收尾。
+"""AgentCompass 集成测试：能力清单、参数组装、报告映射、执行器进度与收尾。
 
 不真实起 docker / 容器；async_run_evaluation 不在本测试触发（延迟 import）。
 """
@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from app.evaluation.agentcompass_adapter import (AGENTCOMPASS_BENCHMARKS, AGENTCOMPASS_IDS,
-                                                 AgentCompassRunner, build_run_kwargs)
+from app.evaluation.agentcompass_adapter import (AGENTCOMPASS_CAPABILITIES, AGENTCOMPASS_BENCHMARK_ID,
+                                                 AGENTCOMPASS_IDS, AgentCompassRunner, build_run_kwargs)
 from app.evaluation.agentcompass_reports import map_run_to_report
 from app.model_registry import ModelRegistry
 from app.store import Store
@@ -29,15 +29,15 @@ def _make_store(tmp_path: Path) -> Store:
     return store
 
 
-def _seed_eval(store: Store, benchmark: str = "Dev") -> None:
+def _seed_eval(store: Store, benchmark: str = "Agent") -> None:
     def op(data):
         data["evaluations"].append({
-            "id": "eval-1", "model_id": "m1", "dataset_id": "ds-1",
-            "benchmark": benchmark, "model_name": "模型1", "dataset_name": "数据集",
+            "id": "eval-1", "model_id": "m1", "dataset_id": None,
+            "benchmark": benchmark, "model_name": "模型1", "dataset_name": "AgentCompass 内置数据",
             "status": "queued", "progress": 0, "logs": [], "report_id": None,
             "simulated": False, "result": None,
             "agent": {"benchmark": "swebench_verified", "harness": "mini_swe_agent",
-                      "environment": "docker"},
+                      "environment": "docker", "model_api_protocol": "auto", "params": None},
         })
     store.update(op)
 
@@ -46,29 +46,48 @@ def _get_eval(store: Store) -> dict:
     return next(t for t in store.snapshot()["evaluations"] if t["id"] == "eval-1")
 
 
-# --------------------------------------------------------------------------- #
-# 映射表
-# --------------------------------------------------------------------------- #
-def test_mapping_complete():
-    assert set(AGENTCOMPASS_BENCHMARKS) == AGENTCOMPASS_IDS
-    for name, mapping in AGENTCOMPASS_BENCHMARKS.items():
-        for key in ("benchmark", "harness", "environment", "model_api_protocol"):
-            assert mapping.get(key), f"{name}.{key} 缺失"
+def _agent_task(**overrides) -> dict:
+    agent = {"benchmark": "swebench_verified", "harness": "mini_swe_agent",
+             "environment": "docker", "model_api_protocol": "openai-chat"}
+    agent.update(overrides)
+    return {"benchmark": "Agent", "agent": agent}
 
 
-def test_mapping_dev():
-    m = AGENTCOMPASS_BENCHMARKS["Dev"]
-    assert m["benchmark"] == "swebench_verified"
-    assert m["harness"] == "mini_swe_agent"
-    assert m["environment"] == "docker"
-    assert m["model_api_protocol"] == "openai-chat"
+# --------------------------------------------------------------------------- #
+# 能力白名单 manifest
+# --------------------------------------------------------------------------- #
+def test_capabilities_manifest():
+    caps = AGENTCOMPASS_CAPABILITIES
+    assert set(caps) == {"benchmarks", "harnesses", "environments", "protocols"}
+    bench_ids = {b["id"] for b in caps["benchmarks"]}
+    harness_ids = {h["id"] for h in caps["harnesses"]}
+    env_ids = {e["id"] for e in caps["environments"]}
+    proto_values = {p["value"] for p in caps["protocols"]}
+    # 白名单范围
+    assert "swebench_verified" in bench_ids and "gaia" in bench_ids
+    assert "aisf_iot" not in bench_ids and "terminalbench2_1" not in bench_ids
+    assert "claude_code" not in harness_ids and "aisf_agent" not in harness_ids
+    assert env_ids == {"docker", "host_process"}
+    assert proto_values == {"auto", "openai-chat", "openai-responses", "anthropic"}
+    # suggested_harnesses 均指向白名单内的 harness
+    for b in caps["benchmarks"]:
+        assert b.get("suggested_harnesses"), f"{b['id']} 缺少 suggested_harnesses"
+        for h in b["suggested_harnesses"]:
+            assert h in harness_ids, f"{b['id']} 引用了未暴露的 harness {h}"
+    for h in caps["harnesses"]:
+        assert h.get("preferred_protocols"), f"{h['id']} 缺少 preferred_protocols"
+
+
+def test_agent_benchmark_id():
+    assert AGENTCOMPASS_BENCHMARK_ID == "Agent"
+    assert AGENTCOMPASS_IDS == frozenset({"Agent"})
 
 
 # --------------------------------------------------------------------------- #
 # build_run_kwargs
 # --------------------------------------------------------------------------- #
 def test_build_run_kwargs_basic():
-    task = {"benchmark": "Dev", "config": {}}
+    task = _agent_task()
     kwargs = build_run_kwargs(task, {"id": "m1"}, {"url": "http://x/v1/"}, "secret",
                               data_dir="/d", results_dir="/r")
     assert kwargs["benchmark"] == "swebench_verified"
@@ -81,20 +100,34 @@ def test_build_run_kwargs_basic():
     assert kwargs["data_dir"] == "/d"
     assert kwargs["results_dir"] == "/r"
     assert kwargs["task_concurrency"] == 1
-    assert kwargs["harness_params"] == {"step_limit": 100, "command_timeout": 2400}
-    assert kwargs["environment_params"] == {"resources": {"cpu": 2, "memory_mb": 4096}}
+    assert kwargs["benchmark_params"] is None
+    assert kwargs["progress"] == "none"
+
+
+def test_build_run_kwargs_auto_protocol():
+    task = _agent_task(benchmark="gaia", harness="openai_chat", model_api_protocol="auto")
+    kwargs = build_run_kwargs(task, {"id": "m1"}, {"url": "http://x"}, "", data_dir="/d", results_dir="/r")
+    assert kwargs["model_api_protocol"] == ""            # auto → 空（harness 默认）
 
 
 def test_build_run_kwargs_sample_ids():
-    task = {"benchmark": "Dev", "config": {"sample_ids": ["a__a-1", "b__b-2"]}}
+    task = _agent_task(params={"sample_ids": ["a__a-1", "b__b-2"]})
     kwargs = build_run_kwargs(task, {"id": "m1"}, {"url": "http://x"}, "", data_dir="/d", results_dir="/r")
     assert kwargs["benchmark_params"]["sample_ids"] == ["a__a-1", "b__b-2"]
 
 
-def test_build_run_kwargs_no_sample_ids():
-    task = {"benchmark": "Dev", "config": {}}
+def test_build_run_kwargs_params():
+    task = _agent_task(params={"task_concurrency": 2, "k": 3, "max_retries": 5})
     kwargs = build_run_kwargs(task, {"id": "m1"}, {"url": "http://x"}, "", data_dir="/d", results_dir="/r")
-    assert kwargs["benchmark_params"] == {}
+    assert kwargs["task_concurrency"] == 2
+    assert kwargs["k"] == 3
+    assert kwargs["max_retries"] == 5
+
+
+def test_build_run_kwargs_missing_harness():
+    task = {"benchmark": "Agent", "agent": {"benchmark": "swebench_verified"}}
+    with pytest.raises(ValueError):
+        build_run_kwargs(task, {"id": "m1"}, {"url": "http://x"}, "", data_dir="/d", results_dir="/r")
 
 
 # --------------------------------------------------------------------------- #
@@ -113,7 +146,7 @@ def _write_run_dir(run_dir: Path, *, correct=0.5, total=4, evaluated=4, error=0,
 def test_map_run_to_report(tmp_path):
     run_dir = tmp_path / "run"
     _write_run_dir(run_dir, correct=0.5)
-    task = {"id": "eval-1", "benchmark": "Dev", "model_name": "模型1",
+    task = {"id": "eval-1", "benchmark": "Agent", "model_name": "模型1",
             "agent": {"benchmark": "swebench_verified", "harness": "mini_swe_agent", "environment": "docker"},
             "owner_user_id": None, "visibility": "private"}
     report, result = map_run_to_report(task, run_dir)
@@ -125,11 +158,12 @@ def test_map_run_to_report(tmp_path):
     assert report["simulated"] is False
     assert report["ruler_id"] is None
     assert report["agent"]["benchmark"] == "swebench_verified"
+    assert report["title"].startswith("swebench_verified")   # title 用 agent benchmark 名
     assert report["summary"].startswith("# 评测完成")
 
 
 def test_map_run_to_report_empty():
-    task = {"id": "eval-1", "benchmark": "Dev", "model_name": "模型1", "agent": {}}
+    task = {"id": "eval-1", "benchmark": "Agent", "model_name": "模型1", "agent": {}}
     report, result = map_run_to_report(task, None)
     assert report["score"] == 0.0
     assert result["total"] == 0.0
@@ -199,6 +233,6 @@ def test_vendor_import_complete():
     benchmarks = BENCHMARKS.names()
     harnesses = HARNESSES.names()
     assert "swebench_verified" in benchmarks
-    assert "aisf_iot" in benchmarks          # aisf 保留
+    assert "aisf_iot" in benchmarks          # aisf 保留（vendor 完整，仅 iCAP 前端不暴露）
     assert "mini_swe_agent" in harnesses
     assert "aisf_agent" in harnesses          # aisf 保留

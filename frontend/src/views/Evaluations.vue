@@ -14,7 +14,6 @@ const rows = ref([]), models = ref([]), datasets = ref([]), rulers = ref([]), di
 let timer
 const names = { queued: '排队中', running: '运行中', paused: '已暂停', completed: '已完成', cancelled: '已取消', failed: '失败' }
 const statusType = (status) => (status === 'completed' ? 'success' : ['cancelled', 'failed'].includes(status) ? 'danger' : 'warning')
-const benchmarks = ['Ruler1', 'Ruler2', 'VLM', 'AISF', 'Dev', 'ASR', 'MT', 'TTS']
 
 async function load() {
   const [tasks, modelRows, datasetRows, rulerResponse] = await Promise.all([
@@ -52,16 +51,23 @@ onUnmounted(() => clearInterval(timer))
     <el-button type="primary" @click="openDialog">+ 发起评测</el-button>
   </div>
   <div class="notice">
-    尺子一（通用能力）与尺子二（通信领域）由内置测评引擎真实执行：25 条内置样例、按维度加权计分并生成报告。
-    VLM / AISF / Dev / ASR / MT / TTS 仍为模拟执行，结果仅用于演示。
+    尺子一（通用能力）与尺子二（通信领域）由内置测评引擎真实执行；Agent 评测由 AgentCompass 真实执行（需 docker）。
+    VLM / AISF / ASR / MT / TTS 仍为模拟执行，结果仅用于演示。
   </div>
   <section class="card card-pad">
     <div class="card-header"><h2>任务列表</h2><span class="muted small">{{ rows.length }} 个任务</span></div>
     <el-table :data="rows" empty-text="暂无任务，点击右上角发起评测">
       <el-table-column prop="model_name" label="模型" min-width="150" />
       <el-table-column prop="dataset_name" label="数据集" min-width="170" />
-      <el-table-column label="测评尺子" min-width="150">
-        <template #default="{ row }">{{ row.ruler_label || `${row.benchmark}（模拟）` }}</template>
+      <el-table-column label="测评类型" min-width="180">
+        <template #default="{ row }">
+          <template v-if="row.ruler_label">{{ row.ruler_label }}</template>
+          <template v-else-if="row.agent">
+            <el-tag size="small" type="info">{{ row.agent.benchmark }}</el-tag>
+            <span class="muted small" style="margin-left:6px">{{ row.agent.harness }} · {{ row.agent.environment }}</span>
+          </template>
+          <template v-else>{{ `${row.benchmark}（模拟）` }}</template>
+        </template>
       </el-table-column>
       <el-table-column label="可见范围" width="110"><template #default="{ row }"><VisibilityTag :visibility="row.visibility" /></template></el-table-column>
       <el-table-column label="进度" min-width="150">
@@ -80,8 +86,8 @@ onUnmounted(() => clearInterval(timer))
       <el-table-column label="操作" width="200">
         <template #default="{ row }">
           <el-button text type="primary" size="small" @click="open(row)">详情</el-button>
-          <el-button v-if="canManage(row) && ['queued', 'running'].includes(row.status)" text size="small" @click="action(row, 'pause')">暂停</el-button>
-          <el-button v-if="canManage(row) && row.status === 'paused'" text size="small" @click="action(row, 'resume')">恢复</el-button>
+          <el-button v-if="canManage(row) && !row.agent && ['queued', 'running'].includes(row.status)" text size="small" @click="action(row, 'pause')">暂停</el-button>
+          <el-button v-if="canManage(row) && !row.agent && row.status === 'paused'" text size="small" @click="action(row, 'resume')">恢复</el-button>
           <el-button v-if="canManage(row) && ['queued', 'running', 'paused'].includes(row.status)" text type="danger" size="small" @click="action(row, 'cancel')">取消</el-button>
         </template>
       </el-table-column>

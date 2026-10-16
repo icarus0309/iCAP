@@ -65,9 +65,10 @@ def map_run_to_report(task: dict, run_dir: Path | None, run_result: Any = None) 
     evaluated = int(counts.get("evaluated", 0) or 0)
     error = int(counts.get("error", 0) or 0)
 
+    benchmark_label = (task.get("agent") or {}).get("benchmark") or task.get("benchmark", "")
     score = round(float(correct_rate) * 100, 1)
     summary = summary_text.strip() or (
-        f"{task['benchmark']} 评测：{evaluated}/{total} 条完成，解决率 {score}%"
+        f"{benchmark_label} 评测：{evaluated}/{total} 条完成，解决率 {score}%"
     )
 
     dimensions = [{
@@ -100,7 +101,7 @@ def map_run_to_report(task: dict, run_dir: Path | None, run_result: Any = None) 
     report = {
         "id": f"report-{uuid.uuid4().hex[:12]}",
         "evaluation_id": task["id"],
-        "title": f"{task['benchmark']} · {task.get('model_name', '')}",
+        "title": f"{benchmark_label} · {task.get('model_name', '')}",
         "score": score,
         "ruler_id": None,
         "agent": task.get("agent") or {},
