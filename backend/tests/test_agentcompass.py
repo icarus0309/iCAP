@@ -107,7 +107,7 @@ def _write_run_dir(run_dir: Path, *, correct=0.5, total=4, evaluated=4, error=0,
     (run_dir / "metrics.json").write_text(json.dumps({
         "series": [{"role": "headline", "value": correct,
                     "counts": {"total": total, "evaluated": evaluated, "error": error}}]}))
-    (run_dir / "summary.md").write_text("# 评测完成\n正确率 50%")
+    (run_dir / "summary.md").write_text("# 评测完成\n正确率 50%", encoding="utf-8")
 
 
 def test_map_run_to_report(tmp_path):
