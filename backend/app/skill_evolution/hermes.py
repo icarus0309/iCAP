@@ -143,6 +143,8 @@ def install_runner(relay, cfg, models, assets, fatal_errors):
         self.config, self.run_dir, self.source = config, Path(run_dir), source
 
     def run_case(self, *, case_id, skill_path, input_text, case_dir, pre_condition=None):
+        if not isinstance(input_text, str) or not input_text.strip():
+            raise ValueError("Hermes 用例缺少有效文本提问")
         case = Path(case_dir).resolve()
         case.mkdir(parents=True, exist_ok=True)
         # Each case (and the B large-model path) has its own home and workspace.
@@ -175,11 +177,11 @@ def install_runner(relay, cfg, models, assets, fatal_errors):
                   "checkpoints": {"enabled": False}}
         # JSON is a subset of YAML; no YAML dependency is needed in the worker.
         (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
-        command = [binary, "chat", "-q", input_text, "-Q", "--source", self.source, "--skills", "icap-task",
+        command = [binary, "chat", "-q", input_text, "-Q", "--source", "tool", "--skills", "icap-task",
                    "--model", models[role]["name"], "--provider", "custom", "--toolsets", "terminal,file", "--max-turns", "12", "--yolo"]
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
         error, stdout, stderr, returncode = "", "", "", 0
-        proc = subprocess.Popen(sandbox_command(runtime, case, workspace, command), env=env, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(sandbox_command(runtime, case, workspace, command), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", start_new_session=True)
         try:
             stdout, stderr = proc.communicate(timeout=cfg["timeout"])

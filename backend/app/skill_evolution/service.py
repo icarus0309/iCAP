@@ -152,6 +152,16 @@ class SkillService:
             item.setdefault("type", "custom")
             item.setdefault("sub_type", "通用")
             item.setdefault("key_steps", [])
+            if not isinstance(item["key_steps"], list) or any(not isinstance(step, dict) for step in item["key_steps"]):
+                raise HTTPException(422, f"用例 {cid} 的 key_steps 必须是对象数组")
+            step_ids = set()
+            for i, step in enumerate(item["key_steps"]):
+                sid = str(step.get("step_id", step.get("id", step.get("name", i + 1))))
+                weight = step.get("weight", 1)
+                if not sid or len(sid) > 80 or sid in step_ids or type(weight) not in (int, float) or not 0 < weight <= 100:
+                    raise HTTPException(422, f"用例 {cid} 的步骤标识须唯一，步骤权重须大于 0 且不超过 100")
+                step_ids.add(sid)
+                step["step_id"] = sid
             messages = []
             if not isinstance(item.get("input"), list):
                 raise HTTPException(422, f"用例 {cid} 的 input 必须是数组")

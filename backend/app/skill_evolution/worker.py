@@ -159,6 +159,15 @@ def main(payload):
     (assets / "rubric.md").write_text(cfg["rubric"], encoding="utf-8")
     dataset = cfg["dataset"]
     for item in dataset:
+        for index, step in enumerate(item.get("key_steps", [])):
+            step["step_id"] = str(step.get("step_id", step.get("id", step.get("name", index + 1))))
+        if cfg["execution_mode"] == "hermes" and not any(entry.get("type") == "text" for entry in item["input"]):
+            messages = []
+            for entry in item["input"]:
+                if entry.get("type") in {"json", "list"}:
+                    data = entry["data"]
+                    messages.extend(json.loads(data) if isinstance(data, str) else data)
+            item["input"].append({"type": "text", "data": "\n\n".join(f"[{m['role']}]\n{m['content']}" for m in messages)})
         for output in item.get("output", []):
             if output["type"] == "onlyllm":
                 output["data"] = str((assets / output["data"]).resolve())

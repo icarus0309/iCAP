@@ -84,7 +84,7 @@ function hermesExample() {
   form.value.skill_content = '---\nname: file-total\ndescription: 使用工具读取 JSON 数组、求和并保存结果。\n---\n读取工作目录的 numbers.json，用 Python 计算数字之和，将总和写入工作目录 result.txt。实际执行工具后只回答总和，不得猜测文件内容。'
   form.value.resources = [{ name: 'numbers.json', content: '[17, 28, 39]' }, { name: 'expected.txt', content: '84' }]
   resourceNames.value = form.value.resources.map(r => r.name)
-  datasetText.value = JSON.stringify([{ id: 'file-sum', type: 'custom', sub_type: '文件计算', input: [{ type: 'text', data: '请读取 numbers.json 计算总和，写入 result.txt，然后回答总和。' }], key_steps: [{ id: 'compute', description: '调用工具读取文件并计算总和', weight: 1 }, { id: 'save', description: '将计算结果写入 result.txt', weight: 1 }], output: [{ type: 'file', expect_path: 'expected.txt', actual_path: 'result.txt' }, { type: 'word', data: '84' }] }], null, 2)
+  datasetText.value = JSON.stringify([{ id: 'file-sum', type: 'custom', sub_type: '文件计算', input: [{ type: 'text', data: '请读取 numbers.json 计算总和，写入 result.txt，然后回答总和。' }], key_steps: [{ id: 'compute', description: '调用工具读取文件并计算总和', weight: 1 }, { id: 'save', description: '将计算结果写入 result.txt', weight: 1 }], output: [{ type: 'file', expect_path: 'expected.txt', actual_path: 'result.txt' }, { type: 'word', data: { whitelist: ['84'], blacklist: [] } }] }], null, 2)
   skillName.value = 'Hermes 示例 SKILL.md'; datasetName.value = '文件工具用例 · 1 条'
 }
 function exampleDownload() {
