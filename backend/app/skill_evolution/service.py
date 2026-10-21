@@ -224,8 +224,16 @@ class SkillService:
                    "current_round": 0, "model_calls": 0, "case_count": min(len(body.dataset), body.cases_limit or 200),
                    "config": cfg, "principal": {"id": principal["id"], "role": principal["role"]},
                    **ownership(principal, body.visibility)}
-            self.store.update(lambda data: data.setdefault("skill_jobs", []).insert(0, row))
-            (self.root / row["id"]).mkdir(mode=0o700)
+            directory = self.root / row["id"]
+            try:
+                directory.mkdir(mode=0o700)
+            except OSError:
+                raise HTTPException(503, "任务存储目录不可写，请联系管理员检查数据目录权限") from None
+            try:
+                self.store.update(lambda data: data.setdefault("skill_jobs", []).insert(0, row))
+            except Exception:
+                directory.rmdir()
+                raise
         return self.public(row, True)
 
     def start(self):

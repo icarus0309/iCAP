@@ -163,3 +163,14 @@ def test_enhanced_stall_triggers_bounded_exploration(workspace):
     assert row["status"] == "completed", (row["error"], row["logs"])
     attempts = [r["exploration"].get("attempts", []) for r in row["result"]["rounds"] if r["exploration"]]
     assert attempts and len(attempts[0]) == 1, row["logs"]
+
+
+def test_storage_failure_does_not_enqueue_orphan_task(workspace):
+    client, app, _ = workspace
+    service = app.state.skill_service
+    blocked = service.root / "not-a-directory"
+    blocked.write_text("fixture", encoding="utf-8")
+    service.root = blocked
+    response = client.post("/api/skill-evolution/jobs", json=payload())
+    assert response.status_code == 503
+    assert app.state.store.snapshot()["skill_jobs"] == []
