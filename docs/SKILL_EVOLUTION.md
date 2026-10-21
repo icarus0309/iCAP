@@ -43,7 +43,18 @@ SKILL_EVOLVE_API_KEY=<由部署人员私下配置>
 
 同名进程环境变量优先。生产文件 `/var/lib/icap/skill-evolution.env` 由 icap 用户持有，权限 0600。专用凭据不注册到模型广场、不返回前端、不进入任务记录和可下载产物。模型连接只通过子进程 stdin 临时传递，避免出现在命令行参数和落盘任务配置中。HTTP 错误不记录厂商响应体，输出和日志另做密钥脱敏。
 
-Hermes 依赖管理员安装并显式设置 `SKILL_EVOLVE_HERMES_ENABLED=true`、`HERMES_BIN` 等平台运行环境。未具备环境时 UI 禁用该选项；不会模拟 Agent 或设备执行。目前生产部署使用单 API 模式。
+### Hermes Agent 运行环境
+
+Linux 服务配置 `SKILL_EVOLVE_HERMES_ENABLED=true`、`ICAP_HERMES_RUNTIME=/opt/icap-hermes`。该目录包含官方 Hermes v0.22.3 源码、独立 Python 3.14 环境及 `venv/bin/hermes`；安装验证通过后由管理员创建 `READY` 文件。目录由 root 管理，服务用户只能读取。未启用或未安装时前端禁用此选项。
+
+- A、B 都支持 Hermes，B 的对照大模型也在独立用例环境运行；执行模型沿用页面选择和平均路由。
+- 通过任务内的回环 HTTP 转发器调用模型，真实厂商凭据只存在父工作进程。Hermes 的配置、环境、命令行及工具均不持有真实密钥。转发器仅开放该任务的执行/对照模型，任务结束即失效；全部推理请求计入同一预算。
+- 使用 bubblewrap 隔离挂载和 PID：只读系统运行文件与 Hermes 运行时，仅当前用例目录可写。无服务器数据目录、其他任务、宿主 `/proc` 或管理配置访问权。Ubuntu 24.04 通过仅针对 `/usr/bin/bwrap` 的 AppArmor `userns` 规则允许命名空间，无需关闭全局限制。
+- 提供 terminal、file 工具，最多 12 个 Agent 回合；单用例受页面超时限制，进程数、文件大小和 CPU 时间另有限制。取消或超时会清理 Agent 及工具子进程。未配置浏览器、联网搜索、Home Assistant 设备服务。
+- 从 Hermes 持久化会话导出真实消息和工具调用，交由原引擎评审过程、简洁度和结果（默认权重 0.4/0.2/0.4）。无参考步骤时按实际步骤评分的平均值计算过程分，修正上游空权重映射恒得零分的问题。
+- `file` 的 `actual_path` 只接受用例工作目录内的相对文本文件名，默认 `result.txt`；服务端评审拒绝路径/符号链接逃逸和超大文件。界面提供可直接使用的“载入工具示例”。
+
+Hermes 安装来源：[官方仓库 v0.22.3](https://github.com/NousResearch/hermes-agent/tree/v0.22.3)、[官方安装说明](https://hermes-agent.nousresearch.com/docs/getting-started/installation/)。源代码未改动；平台适配集中在 `app/skill_evolution/hermes.py`。
 
 ## 产物
 

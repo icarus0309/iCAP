@@ -52,7 +52,11 @@ def build_report(job_dir, cfg, final=False):
                 route = read(cd / "route.json")
                 cases.append({"id": cd.name, "score": score.get("total_score"), "result_score": score.get("result"),
                               "route": route.get("route", "INVALID" if not score else "SUCCESS" if score.get("total_score", 0) >= cfg["outcome_split_threshold"] else "FAILURE"),
-                              "output": result.get("final_output", ""), "feedback": score.get("feedback", ""),
+                              "output": read(cd / "session.json").get("final_output") or result.get("final_output", ""), "feedback": score.get("feedback", ""),
+                              "process_score": score.get("process") if cfg["execution_mode"] == "hermes" else None,
+                              "conciseness_score": score.get("conciseness") if cfg["execution_mode"] == "hermes" else None,
+                              "trajectory": read(cd / "trajectory.json", []) if cfg["execution_mode"] == "hermes" else [],
+                              "large_trajectory": read(cd / "large" / "trajectory.json", []) if cfg["execution_mode"] == "hermes" else [],
                               "analysis": analysis.get("output_analyses", {}), "error": score.get("evaluation_error") or result.get("error", ""),
                               "large_output": read(cd / "large" / "run_result.json").get("final_output", ""),
                               "knowledge": read(cd / "knowledge" / "knowledge.json")})
@@ -82,7 +86,7 @@ def build_report(job_dir, cfg, final=False):
     return report
 
 
-def patch_opt_judge():
+def patch_opt_judge(file_only=False):
     """Translate the platform rubric contract into OPT's analyzer contract.
 
     Upstream OPT silently treats {score: 0} as a pass (missing issues). Reject
@@ -120,11 +124,18 @@ def patch_opt_judge():
                 raise ValueError("评审模型未返回有效的 0–100 分数或判定")
         return float(score), {**verdict, "score": score, "passed": score >= 80, "analysis": verdict.get("reason", ""), "source": "model"}
 
-    SessionAnalyzer._analyze_onlyllm = analyze
+    if not file_only:
+        SessionAnalyzer._analyze_onlyllm = analyze
 
     def analyze_file(self, *, expected_file):
         expected = Path(expected_file["expect_path"]).read_text(encoding="utf-8")
         actual = os.environ.get("ICAP_LAST_OUTPUT", "")
+        if os.environ.get("ICAP_HERMES_WORKSPACE"):
+            root = Path(os.environ["ICAP_HERMES_WORKSPACE"]).resolve()
+            path = (root / expected_file.get("actual_path", "result.txt")).resolve()
+            if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size > 2_000_000:
+                return 0.0, {"analysis": "实际文件缺失、超出任务目录或超过 2 MB", "source": "file"}
+            actual = path.read_text(encoding="utf-8", errors="replace")
         prompt = "比较候选输出与期望文件内容的匹配度。只输出JSON，含0–100的score和analysis字段。\n期望内容：\n" + expected + "\n候选输出：\n" + actual
         verdict = self._parse_json(self.model_client.generate([{"role": "user", "content": prompt}]))
         score = verdict.get("score") if isinstance(verdict, dict) else None
@@ -153,7 +164,7 @@ def main(payload):
                 output["data"] = str((assets / output["data"]).resolve())
             if output["type"] == "file":
                 output["expect_path"] = str((assets / output["expect_path"]).resolve())
-                output["actual_path"] = ""
+                output.setdefault("actual_path", "")
     write(assets / "dataset.json", dataset)
     engine_dir = Path(__file__).resolve().parents[2] / "vendor" / "skill_evolution" / cfg["engine"]
     sys.path.insert(0, str(engine_dir))
@@ -170,6 +181,7 @@ def main(payload):
     from src.config import ModelConfig
 
     calls = payload.get("initial_model_calls", 0)
+    call_lock = threading.Lock()
     fatal_errors = []
     max_calls = cfg["max_model_calls"]
     class Client:
@@ -199,11 +211,12 @@ def main(payload):
                 if key not in {"model", "messages", "stream"}:
                     body[key] = value
             for attempt in range(2):
-                if calls >= max_calls:
-                    fatal_errors.append("已达到本任务模型调用预算")
-                    raise RuntimeError("已达到本任务模型调用预算，请调整预算后新建任务")
-                calls += 1
-                event(model_calls=calls, phase=f"{self.role} 模型调用中")
+                with call_lock:
+                    if calls >= max_calls:
+                        fatal_errors.append("已达到本任务模型调用预算")
+                        raise RuntimeError("已达到本任务模型调用预算，请调整预算后新建任务")
+                    calls += 1
+                    event(model_calls=calls, phase=f"{self.role} 模型调用中")
                 try:
                     with httpx.Client(timeout=self.config.timeout, trust_env=False) as client:
                         response = client.post(url, json=body, headers={"Authorization": "Bearer " + endpoint["api_key"]})
@@ -233,6 +246,48 @@ def main(payload):
                     raise RuntimeError(f"{self.role} 模型响应不符合 Chat Completions 格式") from None
 
     clients = {role: Client(model, role) for role, model in models.items()}
+    relay = None
+    if cfg["execution_mode"] == "hermes" and cfg["operation"] != "bootstrap":
+        from .hermes import InferenceRelay, install_runner
+
+        def hermes_request(role, request_body):
+            nonlocal calls
+            client = clients[role]
+            with call_lock:
+                if calls >= max_calls:
+                    fatal_errors.append("已达到本任务模型调用预算")
+                    raise RuntimeError(fatal_errors[-1])
+                calls += 1
+                endpoint = client.model["endpoints"][client.index % len(client.model["endpoints"])]
+                client.index += 1
+                event(model_calls=calls, phase=f"Hermes {role} 工具执行中")
+            base = endpoint["url"].rstrip("/")
+            url = base if base.endswith("/chat/completions") else base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
+            body = {key: request_body[key] for key in ("messages", "tools", "tool_choice", "parallel_tool_calls", "temperature", "top_p", "stop") if key in request_body}
+            body.update(model=client.model["name"], stream=False, max_tokens=cfg["max_tokens"], temperature=cfg["temperature"])
+            body.update(endpoint.get("thinking_schema", {}).get("disabled", {}))
+            if "qwen3" in client.model["name"].lower():
+                body["enable_thinking"] = False
+            try:
+                with httpx.Client(timeout=cfg["timeout"], trust_env=False) as http:
+                    response = http.post(url, json=body, headers={"Authorization": "Bearer " + endpoint["api_key"]})
+                if response.status_code >= 400:
+                    raise RuntimeError(f"Hermes {role} 模型请求失败 HTTP {response.status_code}")
+                data = response.json()
+                if not data.get("choices"):
+                    raise RuntimeError("Hermes 模型未返回有效结果")
+                encoded = json.dumps(data, ensure_ascii=False)
+                for model in models.values():
+                    for ep in model["endpoints"]:
+                        encoded = encoded.replace(ep["api_key"], "[密钥已隐藏]")
+                return json.loads(encoded)
+            except Exception as exc:
+                error = str(exc) if isinstance(exc, RuntimeError) else "Hermes 模型连接失败或响应无效"
+                fatal_errors.append(error)
+                raise RuntimeError(error) from None
+
+        relay = InferenceRelay(hermes_request, {role: models[role] for role in ("exec", "large") if role in models})
+        install_runner(relay, cfg, models, assets, fatal_errors)
     event(progress=3, phase="准备运行")
     if cfg["operation"] == "bootstrap":
         skill = clients["gen"].generate([
@@ -260,7 +315,7 @@ def main(payload):
         rounds = 1 if cfg["operation"] == "evaluate" else cfg["rounds"]
         common = dict(rounds=rounds, threshold=cfg["threshold"], cases_limit=cfg["cases_limit"],
                       output_dir=str(job_dir / "outputs"), exec_mode=cfg["execution_mode"],
-                      hermes=HermesCliConfig(hermes_bin=os.getenv("HERMES_BIN", "hermes"),
+                      hermes=HermesCliConfig(hermes_bin=os.getenv("HERMES_BIN", "hermes"), seed_user_config=False,
                                             hermes_model=models["exec"]["name"], hermes_timeout=cfg["timeout"]))
         existing = sorted((job_dir / "outputs").glob("*"))
         resume = str(existing[-1]) if payload.get("resume") and existing else None
@@ -274,6 +329,10 @@ def main(payload):
             orchestrator = SelfEvolveOrchestrator(config=config, exec_model_client=clients["exec"],
                                                  eval_model_client=clients["eval"], gen_model_client=clients["gen"])
         else:
+            patch_opt_judge(file_only=True)
+            if relay and "large" in models:
+                common["large_hermes"] = HermesCliConfig(seed_user_config=False, hermes_model=models["large"]["name"],
+                                                         hermes_env={"ICAP_MODEL_ROLE": "large"})
             config = SelfEvolveConfig(**common, exec_model_client=clients["exec"], large_exec_model_client=clients.get("large"),
                                      direct_judge_prompt=str(assets / "rubric.md"), result_threshold=cfg["result_threshold"],
                                      outcome_split_threshold=cfg["outcome_split_threshold"], max_steps=cfg["max_edits"],
@@ -303,6 +362,8 @@ def main(payload):
         finally:
             done.set()
             monitor_thread.join(timeout=3)
+            if relay:
+                relay.close()
         report = build_report(job_dir, cfg, final=True)
         if fatal_errors:
             raise RuntimeError(fatal_errors[-1] + "；已保留已完成的用例，可检查配置后续跑或新建任务")

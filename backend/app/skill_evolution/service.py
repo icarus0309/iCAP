@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,18 @@ def redact(text, secrets=()):
     return re.sub(r"sk-[A-Za-z0-9_-]{12,}", "[密钥已隐藏]", text)
 
 
+def stop_process(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+
+
 class SkillService:
     def __init__(self, store, registry):
         self.store, self.registry = store, registry
@@ -73,8 +86,10 @@ class SkillService:
                        for m in self.registry.list_models(principal)]
         except HTTPException:
             pass
-        hermes = bool(os.getenv("SKILL_EVOLVE_HERMES_ENABLED") == "true"
-                      and shutil.which(os.getenv("HERMES_BIN", "hermes")))
+        runtime = Path(os.getenv("ICAP_HERMES_RUNTIME", "/opt/icap-hermes"))
+        hermes = bool(os.name == "posix" and os.getenv("SKILL_EVOLVE_HERMES_ENABLED") == "true"
+                      and (runtime / "READY").is_file() and (runtime / "venv/bin/hermes").is_file()
+                      and shutil.which("bwrap"))
         return {"models": models, "execution_modes": ["direct"] + (["hermes"] if hermes else []),
                 "upstream_commit": "61f8870e61c37f59781178f49247f7581aeddba7",
                 "engines": [{"id": "opt", "name": "A · 业务推荐", "features": ["结构化编辑", "成功／失败分组", "拒绝经验"]},
@@ -168,7 +183,9 @@ class SkillService:
                 kind = output.get("type")
                 if kind not in {"onlyllm", "word", "format", "text", "file", "tool", "device_state"}:
                     raise HTTPException(422, f"用例 {cid} 含不支持的结果类型")
-                if body.execution_mode == "direct" and kind in {"tool", "device_state"}:
+                if kind == "device_state":
+                    raise HTTPException(422, "当前未配置设备服务，不能校验真实设备状态；Hermes 可执行终端和文件工具")
+                if body.execution_mode == "direct" and kind == "tool":
                     raise HTTPException(422, "单 API 模式无法校验真实设备状态，请使用文本、关键词、JSON 格式或 Rubric 判据")
                 if kind == "onlyllm":
                     name = output.get("data") or "rubric.md"
@@ -195,7 +212,8 @@ class SkillService:
                         raise HTTPException(422, f"用例 {cid} 的期望文件未作为附属资源上传")
                     # Upstream reads these fields separately from data. Never allow
                     # user-supplied host paths to reach either engine.
-                    output.update(data="", expect_path=name, actual_path="")
+                    actual = output.get("actual_path") or (data.get("actual_path") if isinstance(data, dict) else None) or "result.txt"
+                    output.update(data="", expect_path=name, actual_path=resource_name(actual) if body.execution_mode == "hermes" else "")
             if not any(body.output_weights.get(o["type"], 0) > 0 for o in outputs):
                 raise HTTPException(422, f"用例 {cid} 没有权重大于 0 的结果判据")
             item["output"] = outputs
@@ -250,7 +268,7 @@ class SkillService:
         with self.lock:
             for proc in list(self.processes.values()):
                 if proc.poll() is None:
-                    proc.terminate()
+                    stop_process(proc)
         if self.thread:
             self.thread.join(timeout=8)
 
@@ -284,7 +302,7 @@ class SkillService:
         env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         # Explicit server-owned Hermes configuration only; a task cannot inject shell/environment settings.
         if row["execution_mode"] == "hermes":
-            for key in ("HOME", "HERMES_BIN", "HERMES_HOME", "HERMES_MODEL", "HERMES_PROVIDER"):
+            for key in ("ICAP_HERMES_RUNTIME",):
                 if key in os.environ:
                     env[key] = os.environ[key]
         with self.lock:
@@ -294,7 +312,8 @@ class SkillService:
             proc = subprocess.Popen([sys.executable, "-u", "-m", "app.skill_evolution.worker"], cwd=BACKEND,
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     env=env, text=True, encoding="utf-8", errors="replace",
-                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                    start_new_session=os.name == "posix")
             self.processes[identifier] = proc
         deadline = time.monotonic() + 6 * 3600
         watchdog_done = threading.Event()
@@ -302,7 +321,7 @@ class SkillService:
             while not watchdog_done.wait(1):
                 if self.stop.is_set() or time.monotonic() > deadline or self.get(identifier)["status"] == "cancelled":
                     if proc.poll() is None:
-                        proc.terminate()
+                        stop_process(proc)
                     return
         threading.Thread(target=watchdog, daemon=True).start()
         try:
@@ -359,7 +378,7 @@ class SkillService:
                 self.update(identifier, status="cancelled", error="用户取消了任务")
                 proc = self.processes.get(identifier)
                 if proc and proc.poll() is None:
-                    proc.terminate()
+                    stop_process(proc)
             elif action == "resume":
                 if row["status"] not in {"failed", "interrupted", "cancelled"} or identifier in self.processes:
                     raise HTTPException(409, "任务尚未停止，或当前不可续跑")
