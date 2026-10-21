@@ -157,7 +157,12 @@ def install_runner(relay, cfg, models, assets, fatal_errors):
         skill = Path(skill_path).read_text(encoding="utf-8")
         # Supply a stable, valid Skill identity; original content remains intact.
         (skill_dir / "SKILL.md").write_text("---\nname: icap-task\ndescription: Execute the current iCAP evaluation task.\n---\n\n" + skill, encoding="utf-8")
+        judge_files = {str(Path(output.get("expect_path") if output["type"] == "file" else output.get("data")).resolve())
+                       for item in cfg["dataset"] for output in item.get("output", [])
+                       if output["type"] in {"file", "onlyllm"} and (output.get("expect_path") or output.get("data"))}
         for resource in cfg["resources"]:
+            if str((assets / resource["name"]).resolve()) in judge_files:
+                continue
             for root in (workspace, skill_dir):
                 target = root / resource["name"]
                 target.parent.mkdir(parents=True, exist_ok=True)
