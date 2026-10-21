@@ -33,6 +33,7 @@ from .evaluation.agentcompass_adapter import (AGENTCOMPASS_BENCHMARKS, AGENTCOMP
                                               AgentCompassRunner)
 from .model_registry import ModelInput, ModelRegistry
 from .store import Store
+from .skill_evolution.service import SkillService
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -300,6 +301,7 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
     store = Store(base)
     auth = AuthService(base, secret, admin_user, admin_password, demo)
     registry = ModelRegistry(store)
+    skill_service = SkillService(store, registry)
     stop = asyncio.Event()
     runner = EvaluationRunner(store, registry, live=(not demo), stop=stop)
     agent_runner = AgentCompassRunner(
@@ -312,12 +314,14 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        skill_service.start()
         worker = asyncio.create_task(advance_jobs(store, stop, runner, agent_runner, worker_tick))
         yield
         stop.set()
         await worker
         runner.shutdown()
         agent_runner.shutdown()
+        await asyncio.to_thread(skill_service.shutdown)
 
     app = FastAPI(title="InnovationCore AI Platform", version="0.1.0", lifespan=lifespan)
     app.state.store = store
@@ -342,6 +346,9 @@ def create_app(data_dir: str | Path | None = None, demo: bool | None = None,
         if principal["role"] != "admin":
             raise HTTPException(403, "需要管理员权限")
         return principal
+
+    app.include_router(skill_service.router(authorized))
+    app.state.skill_service = skill_service
 
     def scoped_data(principal: dict) -> dict:
         """Filter both records and their referenced resources before returning data."""

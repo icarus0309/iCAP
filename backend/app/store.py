@@ -22,7 +22,7 @@ def seed() -> dict:
             dict(id="ds-3", name="多模态理解样例集", category="多模态", version="v0.9", size=120,
                  description="视觉理解与语音任务示例", files=[]),
         ],
-        "evaluations": [], "reports": [], "deployments": [], "school_jobs": [], "annotations": [],
+        "evaluations": [], "reports": [], "deployments": [], "school_jobs": [], "annotations": [], "skill_jobs": [],
         "papers": [
             dict(id="paper-1", title="Efficient Long-Context Reasoning for Language Models", category="模型架构", year=2026,
                  abstract="长上下文推理效率研究。此条为演示记录，尚未连接 arXiv。", source="示例数据"),

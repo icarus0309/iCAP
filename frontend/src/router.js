@@ -23,6 +23,7 @@ const routes = [
     meta: { title: '评测详情', group: '数据与评测', parent: '/evaluations' } },
   { path: '/reports', component: () => import('./views/Reports.vue'), meta: { title: '评测报告', group: '数据与评测' } },
   { path: '/agents', component: () => import('./views/Agents.vue'), meta: { title: 'Agent 工作台', group: 'Agent 应用' } },
+  { path: '/skill-evolution', component: () => import('./views/SkillEvolution.vue'), meta: { title: 'Skill 自进化', group: '智能应用' } },
   { path: '/school', component: () => import('./views/School.vue'), meta: { title: 'AI School', group: 'AI School' } },
   { path: '/operations', component: () => import('./views/Operations.vue'), meta: { title: '运营与监控', group: '运营中心' } },
   { path: '/:pathMatch(.*)*', redirect: '/' },

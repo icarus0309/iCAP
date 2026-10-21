@@ -13,7 +13,7 @@ const groups = [
   { name: '工作台', links: [['/', '平台概览', '◫']] },
   { name: 'MAAS 服务', links: [['/models', '模型广场与选型', '◇'], ['/leaderboard', '模型榜单', '▥'], ['/deployments', '部署申请', '▣']] },
   { name: '数据与评测', links: [['/datasets', '数据集仓库', '▤'], ['/data-tools', '数据标注与治理', '▥'], ['/evaluations', '评测任务', '◷'], ['/reports', '评测报告', '▧']] },
-  { name: '智能应用', links: [['/agents', 'Agent 工作台', '✧'], ['/school', 'AI School', '◈']] },
+  { name: '智能应用', links: [['/agents', 'Agent 工作台', '✧'], ['/skill-evolution', 'Skill 自进化', '⟳'], ['/school', 'AI School', '◈']] },
   { name: '管理', links: [['/operations', '运营与监控', '▦']] },
 ]
 const isAuthPage = computed(() => route.meta.public === true)
