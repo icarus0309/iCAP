@@ -161,7 +161,9 @@ def main(payload):
     for item in dataset:
         for index, step in enumerate(item.get("key_steps", [])):
             step["step_id"] = str(step.get("step_id", step.get("id", step.get("name", index + 1))))
-        if cfg["execution_mode"] == "hermes" and not any(entry.get("type") == "text" for entry in item["input"]):
+        # OPT only exposes text entries to Hermes; enhanced already renders its
+        # JSON conversation. Adding text there would duplicate the question.
+        if cfg["execution_mode"] == "hermes" and cfg["engine"] == "opt" and not any(entry.get("type") == "text" for entry in item["input"]):
             messages = []
             for entry in item["input"]:
                 if entry.get("type") in {"json", "list"}:
